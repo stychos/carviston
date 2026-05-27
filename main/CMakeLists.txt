@@ -1,0 +1,37 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_config.c"
+        "temperature.c"
+        "leds.c"
+        "buttons.c"
+        "relays.c"
+        "safety.c"
+        "heater_control.c"
+        "auth.c"
+        "wifi_mgr.c"
+        "web_fs.c"
+        "web_server.c"
+        "ota.c"
+        "matter_node.cpp"
+        "event_log.c"
+        "benchmark.c"
+    INCLUDE_DIRS
+        "."
+    EMBED_FILES
+        "web_embedded/setup.html"
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_http_server
+        esp_driver_i2c
+        esp_app_format
+        app_update
+        esp_driver_gpio
+        esp_timer
+        mbedtls
+        spiffs
+        vfs
+)

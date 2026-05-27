@@ -1,0 +1,14 @@
+# Carviston partition table — 16 MB flash (N16R8)
+# Two OTA app slots (4 MB) + NVS + SPIFFS web bundle + Matter factory data.
+# OTA slots sized at 4 MB so esp_matter + BLE + future growth (Matter
+# clusters, OpenThread, etc.) fit with ~1.5 MB headroom on top of our
+# current 931 KB firmware.
+# Name,     Type, SubType,  Offset,    Size,    Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x400000,
+ota_1,      app,  ota_1,    0x420000,  0x400000,
+storage,    data, nvs,      0x820000,  0x10000,
+matter_fac, data, nvs,      0x830000,  0x10000,
+web,        data, spiffs,   0x840000,  0x7c0000,

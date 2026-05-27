@@ -1,0 +1,10 @@
+dependencies:
+  espressif/cjson: "^1.7.18"
+  espressif/mdns: "^1.8.0"
+
+# esp_matter is NOT pulled here. The managed-component version (1.4.x)
+# still references the legacy IDF `json` component which was removed in
+# ESP-IDF 5.0+, so it fails to configure on IDF 6.x. Instead, install
+# the esp-matter SDK locally (git clone + install.sh) and `source` its
+# export.sh in every build shell — that puts the chip-project + matching
+# component glue on EXTRA_COMPONENT_DIRS. See docs/MATTER.md.

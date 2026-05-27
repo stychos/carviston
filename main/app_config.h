@@ -1,0 +1,147 @@
+/* app_config — NVS-backed persistent configuration.
+ *
+ * One struct, one mutex, one save call. Modules read fields directly via
+ * app_config_get_*() snapshot copies; writes go through app_config_update()
+ * + app_config_save().
+ */
+
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define APP_CFG_PASSWORD_HASH_LEN  32   /* PBKDF2-SHA256 output */
+#define APP_CFG_PASSWORD_SALT_LEN  16
+#define APP_CFG_TOKEN_BYTES        32   /* session token raw bytes */
+#define APP_CFG_WIFI_SSID_MAX      33
+#define APP_CFG_WIFI_PASS_MAX      65
+
+typedef enum {
+    HEATING_MODE_SUPER_FAST = 0, /* both heaters continuous until target */
+    HEATING_MODE_FAST,           /* both for N min, rest R min */
+    HEATING_MODE_OPTIMAL,        /* alternate heaters every N min */
+    HEATING_MODE_ECO,            /* alternate + rest R min after each cycle */
+    HEATING_MODE_COUNT
+} heating_mode_t;
+
+typedef enum {
+    POWER_LED_ALWAYS_ON = 0,         /* on whenever MCU is up */
+    POWER_LED_HEATER_ACTIVE,         /* on only when any heater is active */
+} power_led_mode_t;
+
+typedef enum {
+    ECO_LED_WIFI_STATE = 0,          /* indicate wifi connection state */
+    ECO_LED_ECO_MODE,                /* on when <=1 heater is active */
+} eco_led_mode_t;
+
+typedef enum {
+    TEMP_UNIT_CELSIUS = 0,
+    TEMP_UNIT_FAHRENHEIT,
+} temp_unit_t;
+
+typedef enum {
+    WIFI_ROLE_AP = 0,
+    WIFI_ROLE_STA,
+    WIFI_ROLE_HYBRID,                /* try STA for N seconds, fall back to AP */
+} wifi_role_t;
+
+typedef struct {
+    /* --- versioning --- */
+    uint16_t version;                /* config schema version */
+
+    /* --- first-boot / auth --- */
+    bool configured;                 /* password has been set */
+    uint8_t password_hash[APP_CFG_PASSWORD_HASH_LEN];
+    uint8_t password_salt[APP_CFG_PASSWORD_SALT_LEN];
+    uint32_t pbkdf2_iterations;
+    bool dashboard_locked;           /* false (default): dashboard endpoints (read state,
+                                        set target, toggle power, set mode, clear safety)
+                                        are reachable without a token. true: every API
+                                        call requires auth. Settings endpoints are
+                                        ALWAYS password-protected regardless. */
+
+    /* --- boiler --- */
+    heating_mode_t heating_mode;
+    uint8_t target_temp_c;           /* 40,50,60,70,80 */
+    uint8_t shower_ready_c;          /* default 50 */
+
+    /* heating mode timing (minutes) */
+    uint8_t fast_on_min;             /* fast: both heaters on */
+    uint8_t fast_rest_min;           /* fast: rest period */
+    uint8_t optimal_swap_min;        /* optimal: per-heater on time */
+    uint8_t eco_on_min;              /* eco: per-heater on time */
+    uint8_t eco_rest_min;            /* eco: rest after each cycle */
+
+    /* control band */
+    uint8_t hysteresis_c;            /* default 3 */
+
+    /* --- NTC calibration (Beta equation, per-probe in case probes differ) --- */
+    uint32_t ntc_r25_ohm;            /* nominal resistance @25C, default 10000 */
+    uint16_t ntc_beta;               /* Beta value, default 3950 */
+    uint8_t  probe_disagree_c;       /* safety: max regulation-vs-safety delta */
+
+    /* --- LEDs --- */
+    power_led_mode_t power_led_mode;
+    eco_led_mode_t   eco_led_mode;
+
+    /* --- dashboard --- */
+    temp_unit_t dashboard_unit;
+
+    /* --- wifi --- */
+    wifi_role_t wifi_mode;
+    char  sta_ssid[APP_CFG_WIFI_SSID_MAX];
+    char  sta_pass[APP_CFG_WIFI_PASS_MAX];
+    char  ap_ssid[APP_CFG_WIFI_SSID_MAX];   /* if empty, derived from MAC */
+    char  ap_pass[APP_CFG_WIFI_PASS_MAX];   /* if empty, AP is open (first boot) */
+    uint16_t hybrid_sta_seconds;            /* scan/STA window before AP fallback */
+
+    /* --- UX timings --- */
+    uint16_t long_press_ms;                 /* button long-press threshold (default 1500) */
+    uint16_t preview_release_ms;            /* +/- preview hold-after-release (default 3000) */
+
+    /* --- benchmark --- */
+    uint32_t bench_resume_threshold_s;      /* max seconds between reboot and resume; default 600 */
+
+} app_config_t;
+
+/* Load config from NVS, applying defaults for any missing fields.
+ * Safe to call once at boot. */
+esp_err_t app_config_init(void);
+
+/* Atomically copy the current config into *out. */
+void app_config_get(app_config_t *out);
+
+/* Persist *in to NVS. Updates in-memory snapshot. Synchronous — blocks on
+ * the flash sector erase. Use for first-boot / setup paths. */
+esp_err_t app_config_save(const app_config_t *in);
+
+/* Same as app_config_save() for the in-memory effect, but the NVS commit
+ * is deferred to a low-priority worker task. Multiple rapid calls coalesce
+ * into a single flash write after a short idle window, which is what the
+ * Matter chip thread needs when a controller streams attribute updates
+ * (slider drags, mode flicks). */
+esp_err_t app_config_save_deferred(const app_config_t *in);
+
+/* Wipe NVS + restore defaults. Used by "Hardware Reset" in maintenance tab. */
+esp_err_t app_config_factory_reset(void);
+
+/* Convenience helpers — read individual fields under the mutex. */
+heating_mode_t app_config_get_heating_mode(void);
+uint8_t        app_config_get_target_temp(void);
+bool           app_config_is_configured(void);
+bool           app_config_dashboard_locked(void);
+
+/* Returns "carviston-xxxxxx" using last 3 bytes of base MAC.
+ * Caller-supplied buf, must be at least 20 bytes. */
+void app_config_default_ap_ssid(char *buf, size_t buflen);
+
+#ifdef __cplusplus
+}
+#endif

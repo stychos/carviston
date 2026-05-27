@@ -1,0 +1,17 @@
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+# Web
+web/node_modules/
+web/dist/
+web/.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.cache/

@@ -1,0 +1,19 @@
+# clangd uses macOS Apple clang, which doesn't recognize xtensa-specific flags.
+# These flags only matter when cross-compiling with idf.py, not for indexing.
+
+CompileFlags:
+  Remove:
+    - -mlongcalls
+    - -mdisable-hardware-atomics
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -fzero-init-padding-bits=*
+    - -fno-malloc-dce
+    - -march=*
+
+Diagnostics:
+  Suppress:
+    - drv_unknown_argument
+    - drv_unknown_argument_with_suggestion
+    - pp_file_not_found
+    - unused-includes
