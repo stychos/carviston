@@ -21,12 +21,20 @@ function appVersion(isBuild) {
     if (m) cfg = m[1];
   } catch { /* leave '?' if the file moved — visible, not fatal */ }
 
+  // The counter file records the config version it was counting under ("<cfg>
+  // <build>") so build numbering restarts at 0 whenever CFG_VERSION bumps — a
+  // schema change is a new minor line, so 0.7.42 → 0.8.1, not 0.8.43. An old
+  // single-number file (no cfg recorded) is treated as a mismatch and resets.
   const counter = here('./.build_version');
-  let build = 0;
-  try { build = parseInt(readFileSync(counter, 'utf8').trim(), 10) || 0; } catch { /* first build */ }
+  let savedCfg = null, build = 0;
+  try {
+    const parts = readFileSync(counter, 'utf8').trim().split(/\s+/);
+    if (parts.length >= 2) { savedCfg = parts[0]; build = parseInt(parts[1], 10) || 0; }
+  } catch { /* first build */ }
+  if (savedCfg !== cfg) build = 0;   // config schema changed → restart build numbering
   if (isBuild) {
     build += 1;
-    try { writeFileSync(counter, String(build) + '\n'); } catch { /* read-only FS: still show prior */ }
+    try { writeFileSync(counter, `${cfg} ${build}\n`); } catch { /* read-only FS: still show prior */ }
   }
   return `0.${cfg}.${build}`;
 }

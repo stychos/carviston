@@ -304,6 +304,7 @@ static cJSON *config_to_json(const app_config_t *c)
 {
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "device_name", c->device_name);
+    cJSON_AddStringToObject(o, "hostname", c->hostname);
     cJSON_AddNumberToObject(o, "heating_mode", c->heating_mode);
     cJSON_AddNumberToObject(o, "target_c", c->target_temp_c);
     cJSON_AddNumberToObject(o, "shower_ready_c", c->shower_ready_c);
@@ -333,6 +334,26 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddBoolToObject(o, "ap_pass_set",     c->ap_pass[0]  != '\0');
     cJSON_AddBoolToObject(o, "dashboard_locked", c->dashboard_locked);
     return o;
+}
+
+/* Coerce arbitrary user input into a valid DNS label for the DHCP + mDNS
+ * hostname: lowercase, keep only [a-z0-9-], drop the rest, and strip leading/
+ * trailing hyphens. An empty result is stored as "" so the device falls back to
+ * its default ("carviston") rather than advertising an invalid name. */
+static void sanitize_hostname(const char *in, char *out, size_t outsz)
+{
+    size_t n = 0;
+    for (const char *p = in; *p && n + 1 < outsz; ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')
+            out[n++] = c;
+    }
+    out[n] = '\0';
+    size_t start = 0;
+    while (out[start] == '-') start++;
+    if (start) memmove(out, out + start, strlen(out + start) + 1);
+    for (int i = (int)strlen(out) - 1; i >= 0 && out[i] == '-'; --i) out[i] = '\0';
 }
 
 #define UPDATE_NUM(field, key, lo, hi) do {                                   \
@@ -424,6 +445,10 @@ static esp_err_t api_config_put(httpd_req_t *req)
             cfg.device_name[i] = '\0';
     }
 
+    v = cJSON_GetObjectItemCaseSensitive(body, "hostname");
+    if (cJSON_IsString(v) && v->valuestring)
+        sanitize_hostname(v->valuestring, cfg.hostname, sizeof(cfg.hostname));
+
     v = cJSON_GetObjectItemCaseSensitive(body, "sta_ssid");
     if (cJSON_IsString(v) && v->valuestring) strlcpy(cfg.sta_ssid, v->valuestring, sizeof(cfg.sta_ssid));
     v = cJSON_GetObjectItemCaseSensitive(body, "sta_pass");
@@ -450,7 +475,8 @@ static esp_err_t api_config_put(httpd_req_t *req)
         || strcmp(before.sta_ssid, cfg.sta_ssid) != 0
         || strcmp(before.sta_pass, cfg.sta_pass) != 0
         || strcmp(before.ap_ssid,  cfg.ap_ssid)  != 0
-        || strcmp(before.ap_pass,  cfg.ap_pass)  != 0;
+        || strcmp(before.ap_pass,  cfg.ap_pass)  != 0
+        || strcmp(before.hostname, cfg.hostname) != 0;   /* re-register DHCP/mDNS name */
     if (wifi_changed) {
         /* Restart the radio AFTER the response has been flushed. Doing it
          * synchronously kills the AP/STA netif (and therefore the TCP

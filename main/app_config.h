@@ -23,6 +23,7 @@ extern "C" {
 #define APP_CFG_WIFI_SSID_MAX      33
 #define APP_CFG_WIFI_PASS_MAX      65
 #define APP_CFG_DEVICE_NAME_MAX    32   /* user-facing display name shown in the UI */
+#define APP_CFG_HOSTNAME_MAX       32   /* network hostname (DHCP + mDNS label); empty → "carviston" */
 
 typedef enum {
     HEATING_MODE_SUPER_FAST = 0, /* both heaters continuous until target */
@@ -58,6 +59,7 @@ typedef struct {
 
     /* --- identity --- */
     char device_name[APP_CFG_DEVICE_NAME_MAX];  /* display name in the web UI; empty → "Carviston" */
+    char hostname[APP_CFG_HOSTNAME_MAX];         /* network name: DHCP hostname + mDNS; empty → "carviston" */
 
     /* --- first-boot / auth --- */
     bool configured;                 /* password has been set */
@@ -149,6 +151,7 @@ uint8_t        app_config_get_target_temp(void);
 bool           app_config_is_configured(void);
 /* Copy the display name (or "Carviston" if unset) into buf. */
 void           app_config_get_device_name(char *buf, size_t len);
+void           app_config_get_hostname(char *buf, size_t len);
 bool           app_config_dashboard_locked(void);
 
 /* Returns "carviston-xxxxxx" using last 3 bytes of base MAC.

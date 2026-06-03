@@ -17,7 +17,7 @@ static const char *TAG = "app_config";
 #define CFG_NVS_NS        "carviston"
 #define CFG_NVS_BLOB_KEY  "cfg"
 
-#define CFG_VERSION       7
+#define CFG_VERSION       8   /* v8: added `hostname` (DHCP + mDNS network name) */
 
 /* Coalescing window for deferred saves — after a save is signalled we wait
  * this long for further changes to land before committing. Tunes the
@@ -87,6 +87,88 @@ void app_config_default_ap_ssid(char *buf, size_t buflen)
     snprintf(buf, buflen, "carviston-%02x%02x%02x", mac[3], mac[4], mac[5]);
 }
 
+/* --- Durable network + auth store -----------------------------------------
+ * A SECOND copy of the network credentials and the admin password, persisted
+ * under its own NVS key with an INDEPENDENT version. A feature-config schema
+ * bump (CFG_VERSION) rejects the main "cfg" blob and resets it to defaults, but
+ * this blob — rewritten on every save, re-read on every boot, and overlaid back
+ * onto the config — survives, so Wi-Fi, the hostname, and the password carry
+ * across an OTA that changed CFG_VERSION. Bump PRESERVE_VERSION ONLY if this
+ * struct's own layout changes (rare, unrelated to feature config); keep it
+ * append-only. Fixed-width fields keep the on-flash layout deterministic. */
+#define CFG_NVS_PRESERVE_KEY  "netauth"
+#define PRESERVE_VERSION      1
+
+typedef struct {
+    uint16_t version;
+    /* network */
+    uint8_t  wifi_mode;                          /* wifi_role_t value */
+    bool     sta_fallback_enabled;
+    uint16_t sta_fallback_seconds;
+    char     sta_ssid[APP_CFG_WIFI_SSID_MAX];
+    char     sta_pass[APP_CFG_WIFI_PASS_MAX];
+    char     ap_ssid[APP_CFG_WIFI_SSID_MAX];
+    char     ap_pass[APP_CFG_WIFI_PASS_MAX];
+    char     hostname[APP_CFG_HOSTNAME_MAX];
+    /* auth */
+    bool     configured;
+    bool     dashboard_locked;
+    uint32_t pbkdf2_iterations;
+    uint8_t  password_hash[APP_CFG_PASSWORD_HASH_LEN];
+    uint8_t  password_salt[APP_CFG_PASSWORD_SALT_LEN];
+} preserved_cfg_t;
+
+static void preserved_from_cfg(preserved_cfg_t *p, const app_config_t *c)
+{
+    memset(p, 0, sizeof(*p));
+    p->version              = PRESERVE_VERSION;
+    p->wifi_mode            = (uint8_t)c->wifi_mode;
+    p->sta_fallback_enabled = c->sta_fallback_enabled;
+    p->sta_fallback_seconds = c->sta_fallback_seconds;
+    strlcpy(p->sta_ssid, c->sta_ssid, sizeof(p->sta_ssid));
+    strlcpy(p->sta_pass, c->sta_pass, sizeof(p->sta_pass));
+    strlcpy(p->ap_ssid,  c->ap_ssid,  sizeof(p->ap_ssid));
+    strlcpy(p->ap_pass,  c->ap_pass,  sizeof(p->ap_pass));
+    strlcpy(p->hostname, c->hostname, sizeof(p->hostname));
+    p->configured           = c->configured;
+    p->dashboard_locked     = c->dashboard_locked;
+    p->pbkdf2_iterations    = c->pbkdf2_iterations;
+    memcpy(p->password_hash, c->password_hash, sizeof(p->password_hash));
+    memcpy(p->password_salt, c->password_salt, sizeof(p->password_salt));
+}
+
+static void preserved_into_cfg(app_config_t *c, const preserved_cfg_t *p)
+{
+    c->wifi_mode            = (wifi_role_t)p->wifi_mode;
+    c->sta_fallback_enabled = p->sta_fallback_enabled;
+    c->sta_fallback_seconds = p->sta_fallback_seconds;
+    strlcpy(c->sta_ssid, p->sta_ssid, sizeof(c->sta_ssid));
+    strlcpy(c->sta_pass, p->sta_pass, sizeof(c->sta_pass));
+    strlcpy(c->ap_ssid,  p->ap_ssid,  sizeof(c->ap_ssid));
+    strlcpy(c->ap_pass,  p->ap_pass,  sizeof(c->ap_pass));
+    strlcpy(c->hostname, p->hostname, sizeof(c->hostname));
+    c->configured           = p->configured;
+    c->dashboard_locked     = p->dashboard_locked;
+    c->pbkdf2_iterations    = p->pbkdf2_iterations;
+    memcpy(c->password_hash, p->password_hash, sizeof(c->password_hash));
+    memcpy(c->password_salt, p->password_salt, sizeof(c->password_salt));
+}
+
+/* Write ONLY the preserve blob (used to seed it on first boot of a build that
+ * has it, without disturbing the main config blob). */
+static esp_err_t commit_preserved(const app_config_t *in)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition(CFG_NVS_PART, CFG_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    preserved_cfg_t p;
+    preserved_from_cfg(&p, in);
+    err = nvs_set_blob(h, CFG_NVS_PRESERVE_KEY, &p, sizeof(p));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 esp_err_t app_config_init(void)
 {
     if (s_mutex == NULL) {
@@ -124,12 +206,38 @@ esp_err_t app_config_init(void)
             ESP_LOGI(TAG, "config loaded (v%u, configured=%d)",
                      (unsigned)tmp.version, (int)tmp.configured);
         } else {
-            ESP_LOGW(TAG, "config schema mismatch — using defaults");
+            ESP_LOGW(TAG, "config schema mismatch — feature config reset to "
+                          "defaults; network + auth restored from preserve store");
         }
     } else {
         ESP_LOGI(TAG, "no stored blob — using defaults");
     }
+
+    /* Overlay the version-independent network + auth store. Always applied:
+     * after a normal boot it's a no-op (kept in sync on every save), but after
+     * a CFG_VERSION reset above it carries Wi-Fi, hostname and password across
+     * the upgrade. Absent on the FIRST boot of a build that introduced this
+     * store — then we seed it from whatever we loaded so the NEXT OTA is safe. */
+    bool have_preserved = false;
+    size_t psz = 0;
+    if (nvs_get_blob(h, CFG_NVS_PRESERVE_KEY, NULL, &psz) == ESP_OK &&
+        psz == sizeof(preserved_cfg_t)) {
+        preserved_cfg_t p;
+        if (nvs_get_blob(h, CFG_NVS_PRESERVE_KEY, &p, &psz) == ESP_OK &&
+            p.version == PRESERVE_VERSION) {
+            preserved_into_cfg(&s_cfg, &p);
+            have_preserved = true;
+            ESP_LOGI(TAG, "network + auth restored from preserve store (configured=%d)",
+                     (int)s_cfg.configured);
+        }
+    }
     nvs_close(h);
+
+    if (!have_preserved) {
+        esp_err_t serr = commit_preserved(&s_cfg);
+        if (serr != ESP_OK)
+            ESP_LOGW(TAG, "preserve store seed failed: %s", esp_err_to_name(serr));
+    }
     return ESP_OK;
 }
 
@@ -152,6 +260,13 @@ static esp_err_t commit_to_nvs(const app_config_t *in)
         return err;
     }
     err = nvs_set_blob(h, CFG_NVS_BLOB_KEY, in, sizeof(*in));
+    if (err == ESP_OK) {
+        /* Mirror network + auth into the version-independent store in the SAME
+         * transaction, so the two blobs commit atomically and never diverge. */
+        preserved_cfg_t p;
+        preserved_from_cfg(&p, in);
+        err = nvs_set_blob(h, CFG_NVS_PRESERVE_KEY, &p, sizeof(p));
+    }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err == ESP_OK) ESP_LOGI(TAG, "config saved");
@@ -272,6 +387,17 @@ void app_config_get_device_name(char *buf, size_t len)
     /* Fall back to the product name when the user has cleared it. */
     const char *name = s_cfg.device_name[0] ? s_cfg.device_name : "Carviston";
     strlcpy(buf, name, len);
+    xSemaphoreGive(s_mutex);
+}
+
+void app_config_get_hostname(char *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Lowercase DNS label. Empty → "carviston" so the device never advertises
+     * the SDK default ("espressif") on the router or at <name>.local. */
+    const char *h = s_cfg.hostname[0] ? s_cfg.hostname : "carviston";
+    strlcpy(buf, h, len);
     xSemaphoreGive(s_mutex);
 }
 

@@ -54,6 +54,28 @@ async function saveDeviceName() {
   }
 }
 
+/* --- Network hostname (DHCP name on the router + <name>.local). Must be a DNS
+ * label, so we coerce to lowercase [a-z0-9-] and strip edge hyphens, mirroring
+ * the firmware's sanitize_hostname so the field shows exactly what gets stored.
+ * Saving triggers a brief Wi-Fi reconnect (the name re-registers via DHCP). */
+const hostname = ref(props.cfg.hostname || '');
+watch(() => props.cfg.hostname, v => { hostname.value = v || ''; });
+function normalizeHost(s) {
+  return s.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+async function saveHostname() {
+  const h = normalizeHost(hostname.value);
+  hostname.value = h;                                   /* reflect the cleanup in the field */
+  if (h === (props.cfg.hostname || '')) return;         /* nothing changed */
+  try {
+    await props.onSave({ hostname: h });
+    toast.add({ severity: 'success', summary: 'Saved — reconnecting Wi-Fi…', life: 1800 });
+  } catch (e) {
+    hostname.value = props.cfg.hostname || '';
+    toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
+  }
+}
+
 /* Auto-save on every Select change. The Select's @change fires only on
  * user interaction (not on the watch above that mirrors external cfg
  * updates), so we don't risk an echo loop. The backend coalesces rapid
@@ -126,13 +148,26 @@ async function changePassword() {
 
 <template>
   <div class="stack">
-    <div>
-      <label class="muted">Device name</label>
-      <InputText v-model="deviceName" fluid maxlength="31" placeholder="Carviston"
-                 @blur="saveDeviceName" @keyup.enter="saveDeviceName" />
-      <p class="muted" style="margin: 4px 0 0 0; font-size: 12px;">
-        Shown in the dashboard header and browser tab.
-      </p>
+    <div class="app-grid-2">
+      <div>
+        <label class="muted">Device name</label>
+        <InputText v-model="deviceName" fluid maxlength="31" placeholder="Carviston"
+                   @blur="saveDeviceName" @keyup.enter="saveDeviceName" />
+        <p class="muted" style="margin: 4px 0 0 0; font-size: 12px;">
+          Shown in the dashboard header and browser tab.
+        </p>
+      </div>
+
+      <div>
+        <label class="muted">Network hostname</label>
+        <InputText v-model="hostname" fluid maxlength="31" placeholder="carviston"
+                   @blur="saveHostname" @keyup.enter="saveHostname" />
+        <p class="muted" style="margin: 4px 0 0 0; font-size: 12px;">
+          How the device appears on your router and at
+          <code>{{ (hostname || 'carviston') }}.local</code>. Lowercase letters,
+          numbers and hyphens only. Changing it briefly reconnects Wi-Fi.
+        </p>
+      </div>
     </div>
 
     <div class="app-grid-3">
@@ -204,8 +239,15 @@ async function changePassword() {
   grid-template-columns: 1fr 1fr 1fr;
   gap: 12px;
 }
+.app-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: start;   /* inputs align at the top even when helper text differs in height */
+}
 .app-grid-align-center { align-items: center; }
 @media (max-width: 520px) {
   .app-grid-3 { grid-template-columns: 1fr; }
+  .app-grid-2 { grid-template-columns: 1fr; }
 }
 </style>

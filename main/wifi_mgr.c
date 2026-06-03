@@ -343,9 +343,13 @@ esp_err_t wifi_mgr_init(void)
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL, NULL));
 
-    /* Best-effort mDNS so the device is reachable at carviston.local. */
+    /* Best-effort mDNS so the device is reachable at <hostname>.local. The
+     * hostname is configurable (defaults to "carviston"); the netif/DHCP name
+     * the router shows is set to the same value in apply_hostname(). */
     if (mdns_init() == ESP_OK) {
-        mdns_hostname_set("carviston");
+        char hn[APP_CFG_HOSTNAME_MAX];
+        app_config_get_hostname(hn, sizeof hn);
+        mdns_hostname_set(hn);
         mdns_instance_name_set("Carviston Water Heater");
         mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     }
@@ -425,6 +429,21 @@ static void apply_rf_profile(wifi_interface_t iface)
         ESP_LOGW(TAG, "set_bandwidth(HT20): %s", esp_err_to_name(err));
 }
 
+/* Apply the configured network name to the active interface (the DHCP hostname
+ * the router displays) and to mDNS. esp_netif_set_hostname needs the netif
+ * STARTED, so this runs after esp_wifi_start(); a change takes effect on the
+ * next association, which is why a hostname edit triggers wifi_mgr_restart(). */
+static void apply_hostname(esp_netif_t *netif)
+{
+    char hn[APP_CFG_HOSTNAME_MAX];
+    app_config_get_hostname(hn, sizeof hn);
+    if (netif) {
+        esp_err_t e = esp_netif_set_hostname(netif, hn);
+        if (e != ESP_OK) ESP_LOGW(TAG, "set_hostname: %s", esp_err_to_name(e));
+    }
+    mdns_hostname_set(hn);
+}
+
 esp_err_t wifi_mgr_start(void)
 {
     app_config_t cfg;
@@ -443,6 +462,7 @@ esp_err_t wifi_mgr_start(void)
         configure_ap(&cfg);
         ESP_ERROR_CHECK(esp_wifi_start());
         apply_rf_profile(WIFI_IF_AP);
+        apply_hostname(s_ap_netif);
         s_state = WIFI_STATE_AP;
         event_log_emit(EV_WIFI_AP, 0, 0, NULL);
         return ESP_OK;
@@ -454,6 +474,7 @@ esp_err_t wifi_mgr_start(void)
     configure_sta(&cfg);
     ESP_ERROR_CHECK(esp_wifi_start());
     apply_rf_profile(WIFI_IF_STA);
+    apply_hostname(s_sta_netif);
     return ESP_OK;
 }
 
