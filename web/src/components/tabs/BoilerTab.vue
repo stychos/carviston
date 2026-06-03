@@ -1,6 +1,5 @@
 <script setup>
 import { reactive, watch } from 'vue';
-import Select from 'primevue/select';
 import InputNumber from 'primevue/inputnumber';
 import Button from 'primevue/button';
 import { useToast } from 'primevue/usetoast';
@@ -10,19 +9,6 @@ const props = defineProps({
   onSave: { type: Function, required: true },
 });
 const toast = useToast();
-
-const POWER_LED_MODES = [
-  { v: 0, l: 'Always on' },
-  { v: 1, l: 'Only when a heater is active' },
-];
-const ECO_LED_MODES = [
-  { v: 0, l: 'Wi-Fi state' },
-  { v: 1, l: 'Eco mode indicator' },
-];
-const UNITS = [
-  { v: 0, l: 'Celsius' },
-  { v: 1, l: 'Fahrenheit' },
-];
 
 const form = reactive({ ...props.cfg });
 watch(() => props.cfg, c => Object.assign(form, c));
@@ -79,23 +65,8 @@ async function save() {
       <InputNumber v-model="form.shower_ready_c" :min="30" :max="70" fluid showButtons />
     </div>
 
-    <div class="row" style="gap: 12px;">
-      <div style="flex:1">
-        <label class="muted">Power LED</label>
-        <Select v-model="form.power_led_mode" :options="POWER_LED_MODES" optionLabel="l" optionValue="v" fluid />
-      </div>
-      <div style="flex:1">
-        <label class="muted">ECO LED</label>
-        <Select v-model="form.eco_led_mode" :options="ECO_LED_MODES" optionLabel="l" optionValue="v" fluid />
-      </div>
-    </div>
-    <div>
-      <label class="muted">Dashboard unit</label>
-      <Select v-model="form.dashboard_unit" :options="UNITS" optionLabel="l" optionValue="v" fluid />
-    </div>
-
     <details class="muted" style="margin-top: 4px;">
-      <summary style="cursor: pointer;">NTC calibration</summary>
+      <summary style="cursor: pointer;">Advanced — temperature sensor calibration</summary>
       <div class="row" style="gap: 12px; margin-top: 10px;">
         <div style="flex:1">
           <label class="muted">R25 (ohm)</label>
@@ -106,12 +77,12 @@ async function save() {
           <InputNumber v-model="form.ntc_beta" :min="2000" :max="5500" fluid />
         </div>
         <div style="flex:1">
-          <label class="muted">Probe disagree (°C)</label>
+          <label class="muted">Mismatch threshold (°C)</label>
           <InputNumber v-model="form.probe_disagree_c" :min="1" :max="20" fluid />
         </div>
       </div>
     </details>
 
-    <Button label="Save boiler settings" @click="save" />
+    <Button label="Save heater settings" @click="save" />
   </div>
 </template>

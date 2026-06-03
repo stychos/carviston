@@ -2,11 +2,20 @@ import { ref } from 'vue';
 import { api, setToken, token } from './api.js';
 import { disconnectLive } from './liveState.js';
 
-export const authStatus = ref({ configured: false, authenticated: false, dashboard_locked: false });
+/* null = status not yet known. The view layer must NOT guess a value here:
+ * defaulting to `configured:false` made the UI paint the Setup form before the
+ * device had answered, which on a poor link flashed for seconds and then
+ * snapped to the dashboard. Stay null until /api/auth/status actually resolves;
+ * App.vue shows the boot spinner meanwhile and retries. */
+export const authStatus = ref(null);
 
 export async function refreshStatus() {
+  /* On failure, leave the previous value untouched rather than wiping it to a
+   * fabricated "unconfigured": on first load that keeps the spinner up (caller
+   * retries); on a post-action refresh it avoids a transient timeout dumping an
+   * authenticated user back to Setup/Login. */
   try { authStatus.value = await api.get('/api/auth/status'); }
-  catch { authStatus.value = { configured: false, authenticated: false }; }
+  catch { /* keep prior status; caller decides whether to retry */ }
   return authStatus.value;
 }
 

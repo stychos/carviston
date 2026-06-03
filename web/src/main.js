@@ -6,6 +6,7 @@ import ConfirmationService from 'primevue/confirmationservice';
 
 import 'primeicons/primeicons.css';
 import './style.css';
+import './composables/theme.js';   // applies saved theme + tracks OS changes
 
 import App from './App.vue';
 

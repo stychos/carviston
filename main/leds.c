@@ -26,6 +26,17 @@ static const char *TAG = "leds";
 
 #define RENDER_INTERVAL_MS  100   /* 10 Hz */
 
+/* While heating, the next threshold LED above the current temp blinks. */
+#define TEMP_BLINK_PERIOD_MS  1000
+#define TEMP_BLINK_ON_MS      500
+
+/* The 5 temp LEDs are a coarse 10 °C-step gauge (40..80). Light each step once
+ * the temperature is within half a step of it (round to NEAREST mark) rather
+ * than only after it's fully crossed — otherwise resting just below target
+ * (e.g. 78 °C with an 80 °C target) would light only up to 70 and read as "70".
+ * With this, 78 rounds to 80. Half of the 10 °C step: */
+#define TEMP_LED_HALF_STEP_C  5.0f
+
 static const gpio_num_t s_temp_leds[5] = {
     GPIO_TEMP_40, GPIO_TEMP_50, GPIO_TEMP_60, GPIO_TEMP_70, GPIO_TEMP_80,
 };
@@ -209,10 +220,20 @@ static void render_once(void)
             s_preview_target = 0;
         }
     }
-    if (!preview_active && st.master_enabled) {
+    if (!preview_active && st.master_enabled && !isnan(st.current_temp_c)) {
+        int next = -1;
         for (size_t i = 0; i < 5; ++i) {
-            temp_on[i] = !isnan(st.current_temp_c) &&
-                         st.current_temp_c >= (float)s_temp_thresholds[i];
+            if (st.current_temp_c >= (float)s_temp_thresholds[i] - TEMP_LED_HALF_STEP_C) {
+                temp_on[i] = true;   /* round to nearest mark */
+            } else {
+                next = (int)i;   /* first threshold not yet reached */
+                break;
+            }
+        }
+        /* Heating toward `next` → blink it at 1 Hz instead of leaving it dark. */
+        if (next >= 0 && st.any_heater_active) {
+            uint32_t t = (uint32_t)((now_us / 1000ULL) % TEMP_BLINK_PERIOD_MS);
+            temp_on[next] = (t < TEMP_BLINK_ON_MS);
         }
     }
     /* Master OFF without active preview → all temp LEDs off. */

@@ -1,5 +1,6 @@
 #include "event_log.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -85,6 +86,26 @@ static void flusher_task(void *arg)
     }
 }
 
+static const char *s_event_names[] = {
+    "boot", "shutdown", "reboot_request", "factory_reset",
+    "wifi_ap", "wifi_sta_connected", "wifi_sta_disconnected",
+    "time_synced",
+    "button_press", "button_long",
+    "mode_change", "target_change",
+    "master_on", "master_off",
+    "heater_on", "heater_off",
+    "safety_fault", "safety_cleared",
+    "ota_start", "ota_done", "ota_fail",
+    "bench_start", "bench_end", "bench_abort",
+};
+
+const char *event_type_name(event_type_t type)
+{
+    size_t i = (size_t)type;
+    return (i < sizeof(s_event_names) / sizeof(s_event_names[0]))
+        ? s_event_names[i] : "unknown";
+}
+
 void event_log_emit(event_type_t type, int16_t ia, int16_t ib, const char *text)
 {
     if (!s_inited) return;
@@ -110,6 +131,19 @@ void event_log_emit(event_type_t type, int16_t ia, int16_t ib, const char *text)
     if (s_meta.count < EVENT_LOG_CAP) s_meta.count++;
     s_dirty = true;
     xSemaphoreGive(s_lock);
+
+    /* Mirror the event to the serial console so `idf.py monitor` shows a
+     * live trace alongside the in-memory ring. Format keeps the snake_case
+     * name + non-zero args + text, matching what the web UI's Log tab and
+     * /api/log return. */
+    const char *name = event_type_name(type);
+    if (text && text[0]) {
+        ESP_LOGI(TAG, "%s a=%d b=%d %s", name, (int)ia, (int)ib, text);
+    } else if (ia || ib) {
+        ESP_LOGI(TAG, "%s a=%d b=%d", name, (int)ia, (int)ib);
+    } else {
+        ESP_LOGI(TAG, "%s", name);
+    }
 }
 
 int event_log_snapshot(event_record_t *out, int cap)
@@ -126,6 +160,46 @@ int event_log_snapshot(event_record_t *out, int cap)
     }
     xSemaphoreGive(s_lock);
     return n;
+}
+
+void event_log_clear(void)
+{
+    if (!s_inited) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memset(s_ring, 0, sizeof(s_ring));
+    s_meta.head  = 0;
+    s_meta.count = 0;
+    save_locked();
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "event log cleared");
+}
+
+void event_log_purge_benchmarks(void)
+{
+    if (!s_inited) return;
+    /* Heap scratch (8 KB) — the ring is too large to copy onto the httpd
+     * handler's stack. Bail quietly if the alloc fails; nothing is mutated. */
+    event_record_t *keep = malloc(sizeof(s_ring));
+    if (!keep) { ESP_LOGW(TAG, "purge_benchmarks: no memory"); return; }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    int oldest = ((int)s_meta.head - (int)s_meta.count + EVENT_LOG_CAP) % EVENT_LOG_CAP;
+    int n = 0;
+    for (int i = 0; i < (int)s_meta.count; ++i) {
+        const event_record_t *r = &s_ring[(oldest + i) % EVENT_LOG_CAP];
+        if (r->type == EV_BENCH_START || r->type == EV_BENCH_END || r->type == EV_BENCH_ABORT)
+            continue;
+        keep[n++] = *r;
+    }
+    memset(s_ring, 0, sizeof(s_ring));
+    memcpy(s_ring, keep, (size_t)n * sizeof(event_record_t));
+    s_meta.head  = (uint16_t)(n % EVENT_LOG_CAP);   /* n <= CAP; n==CAP wraps to 0 (full) */
+    s_meta.count = (uint16_t)n;
+    save_locked();
+    xSemaphoreGive(s_lock);
+
+    free(keep);
+    ESP_LOGI(TAG, "benchmarks purged; %d events kept", n);
 }
 
 esp_err_t event_log_init(void)

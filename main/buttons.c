@@ -19,8 +19,10 @@ static const gpio_num_t s_pins[BTN_COUNT] = {
     [BTN_POWER]  = 16,
     [BTN_ECO]    = 17,
     [BTN_SHOWER] = 18,
-    [BTN_PLUS]   = 40,
-    [BTN_MINUS]  = 41,
+    /* PLUS/MINUS are on 41/40 (swapped from the original 40/41) to match the
+     * as-built wiring — the +/- pads were crossed on the harness. */
+    [BTN_PLUS]   = 41,
+    [BTN_MINUS]  = 40,
 };
 
 typedef struct {
@@ -35,10 +37,33 @@ static btn_state_t s_btn[BTN_COUNT];
 static QueueHandle_t s_queue;
 static _Atomic uint8_t s_held_mask;
 
+static const char *kind_name(button_kind_t k)
+{
+    switch (k) {
+        case BTN_KIND_PRESS:   return "PRESS";
+        case BTN_KIND_RELEASE: return "RELEASE";
+        case BTN_KIND_LONG:    return "LONG";
+        default:               return "?";
+    }
+}
+
+static const char *id_name(uint8_t id)
+{
+    switch (id) {
+        case BTN_POWER:  return "POWER";
+        case BTN_ECO:    return "ECO";
+        case BTN_SHOWER: return "SHOWER";
+        case BTN_PLUS:   return "PLUS";
+        case BTN_MINUS:  return "MINUS";
+        default:         return "?";
+    }
+}
+
 static void send(uint8_t id, button_kind_t k, uint32_t held_ms)
 {
     button_event_t ev = { .id = id, .kind = (uint8_t)k,
                           .held_ms = (uint16_t)(held_ms > 0xFFFFu ? 0xFFFFu : held_ms) };
+    ESP_LOGI(TAG, "%s %s held=%lu ms", id_name(id), kind_name(k), (unsigned long)held_ms);
     xQueueSend(s_queue, &ev, 0);
 }
 
@@ -64,7 +89,9 @@ static void button_task(void *arg)
         uint8_t held = 0;
 
         for (size_t i = 0; i < BTN_COUNT; ++i) {
-            uint8_t raw = (uint8_t)gpio_get_level(s_pins[i]);
+            /* Capacitive sensor buttons are active-HIGH (HIGH = touched).
+             * Invert to the driver's internal convention: 0 = pressed, 1 = idle. */
+            uint8_t raw = gpio_get_level(s_pins[i]) ? 0u : 1u;
             btn_state_t *b = &s_btn[i];
 
             if (raw == b->stable) {
@@ -114,8 +141,8 @@ esp_err_t buttons_init(void)
     gpio_config_t cfg = {
         .pin_bit_mask = mask,
         .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
     esp_err_t err = gpio_config(&cfg);

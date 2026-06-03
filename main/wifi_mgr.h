@@ -1,14 +1,12 @@
-/* wifi_mgr — AP / STA / hybrid network bring-up.
+/* wifi_mgr — AP / STA network bring-up.
  *
- *   AP:     unconditional SoftAP. SSID/pass from config (defaults derived
- *           from MAC if unset).
- *   STA:    join configured network. Failed connects retry with exponential
- *           backoff (1 s → 30 s, reset on success) so a wrong password can't
- *           starve the rest of the firmware on the same core.
- *   HYBRID: APSTA — SoftAP and STA come up simultaneously. AP is reachable
- *           instantly; STA tries in the background and promotes the state
- *           to STA_CONNECTED on got-IP. AP stays up as a permanent
- *           fall-back path. No blocking on app_main.
+ *   AP:  unconditional SoftAP. SSID/pass from config (defaults derived
+ *        from MAC if unset).
+ *   STA: join configured network. Failed connects retry with exponential
+ *        backoff (1 s → 30 s, reset on success) so a wrong password can't
+ *        starve the rest of the firmware on the same core. If no IP arrives
+ *        within sta_fallback_seconds, the radio is promoted to APSTA and a
+ *        recovery AP comes up so the device stays reachable to fix settings.
  *
  * On first boot (!configured) we always force AP mode regardless of stored
  * wifi_mode so the user has a path to set the password.
@@ -94,7 +92,7 @@ typedef struct {
  * up to `timeout_s` seconds. The radio is restored to the prior config
  * regardless of outcome; the call does NOT persist anything to NVS.
  *
- * Must be called while the AP is up (pure AP or APSTA hybrid). Returns
+ * Must be called while the AP is up (pure AP or the APSTA recovery AP). Returns
  * ESP_ERR_INVALID_STATE if currently in pure STA mode, since testing
  * would otherwise disconnect the caller.
  *

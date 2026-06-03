@@ -29,6 +29,11 @@ static const char *TAG = "wifi";
 #define RECONNECT_DELAY_MIN_MS   1000u
 #define RECONNECT_DELAY_MAX_MS  30000u
 
+/* Pure-STA → APSTA fallback. If STA can't get an IP within
+ * app_config.sta_fallback_seconds we promote to APSTA so the user has a
+ * way to reach the device. Both the toggle and the timeout are user-
+ * configurable from the Wi-Fi tab. */
+
 static esp_netif_t *s_ap_netif;
 static esp_netif_t *s_sta_netif;
 
@@ -45,12 +50,23 @@ static volatile bool s_time_synced;
  * down and will bring the radio back up itself. */
 static volatile bool s_intentional_stop;
 
-/* True when the active role keeps the SoftAP up (AP or HYBRID/APSTA). Lets
- * wifi_mgr_is_up() report true even before STA gets an IP in hybrid mode. */
+/* True when a SoftAP is up — either pure AP mode, or the recovery AP that the
+ * STA-fallback path promotes to APSTA. Lets wifi_mgr_is_up() report true even
+ * while STA has no IP. */
 static volatile bool s_ap_active;
 
 static esp_timer_handle_t s_reconnect_timer;
 static uint32_t           s_reconnect_delay_ms = RECONNECT_DELAY_MIN_MS;
+/* Set when reconnect_timer_cb has dropped the WS sockets and re-armed itself
+ * for a short drain window; the next fire performs the actual esp_wifi_connect()
+ * without ever blocking the shared esp_timer task. */
+static volatile bool      s_reconnect_drain_pending;
+
+/* Microsecond timestamp of the current STA attempt cycle. Set when STA
+ * is started without a working connection, cleared on GOT_IP and when
+ * the radio is reconfigured. 0 = no active attempt. */
+static int64_t  s_sta_attempt_start_us;
+static bool     s_sta_fallback_armed;     /* fallback only fires once per attempt cycle */
 
 static wifi_mgr_disruption_cb_t s_disruption_cb;
 
@@ -59,10 +75,34 @@ void wifi_mgr_set_disruption_cb(wifi_mgr_disruption_cb_t cb)
     s_disruption_cb = cb;
 }
 
+/* Tear-down delay after running the disruption callback.
+ *
+ * httpd_sess_trigger_close() (used inside web_server_close_all_ws) is
+ * ASYNCHRONOUS — it marks each fd for closure and pokes the httpd worker
+ * via its control socket, but the actual close() runs on httpd's task on
+ * the next select() iteration. If the caller barrels straight on into
+ * esp_wifi_stop() / esp_wifi_set_mode() / esp_wifi_connect() before that
+ * iteration runs, the netif (or the AP's channel) changes under fds
+ * httpd still thinks are live — which manifests as the recv-128 /
+ * "WS frame is not properly masked" storm we keep hitting.
+ *
+ * 250 ms is more than enough: httpd's control-socket wake unblocks the
+ * select() within a couple of ms, and the close path is cheap. The
+ * delay is yielded with vTaskDelay so other tasks (especially httpd's
+ * own worker) get the CPU. */
+#define DISRUPTION_DRAIN_MS  250
+
 static void fire_disruption(void)
 {
-    if (s_disruption_cb) s_disruption_cb();
+    if (!s_disruption_cb) return;
+    s_disruption_cb();
+    vTaskDelay(pdMS_TO_TICKS(DISRUPTION_DRAIN_MS));
 }
+
+/* Forward decls — promote_sta_to_apsta_fallback uses fill_ap_config, and
+ * the reconnect timer calls the promotion helper. */
+static void fill_ap_config(const app_config_t *cfg, wifi_config_t *ap_wc);
+static void promote_sta_to_apsta_fallback(void);
 
 /* --- STA credential test state ------------------------------------------- */
 #define TEST_BIT_OK    BIT0
@@ -96,9 +136,58 @@ static void start_sntp_once(void)
 static void reconnect_timer_cb(void *arg)
 {
     (void)arg;
-    if (s_intentional_stop) return;
+    if (s_intentional_stop) { s_reconnect_drain_pending = false; return; }
+
+    /* Second stage of an APSTA reconnect: WS sockets were dropped on the
+     * previous fire and the drain window has now elapsed, so it's safe to
+     * hop the channel. */
+    if (s_reconnect_drain_pending) {
+        s_reconnect_drain_pending = false;
+        esp_wifi_connect();
+        return;
+    }
+
+    wifi_mode_t m = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&m);
+
+    /* Recovery-AP fallback: if pure STA has been failing for longer than
+     * the user-configured window without ever getting an IP, bring the AP
+     * up alongside it. Only fires once per attempt cycle. */
+    if (m == WIFI_MODE_STA && s_sta_fallback_armed && s_sta_attempt_start_us > 0) {
+        app_config_t cfg;
+        app_config_get(&cfg);
+        if (cfg.sta_fallback_enabled && cfg.sta_fallback_seconds > 0) {
+            int64_t elapsed_s = (esp_timer_get_time() - s_sta_attempt_start_us) / 1000000LL;
+            if (elapsed_s >= cfg.sta_fallback_seconds) {
+                promote_sta_to_apsta_fallback();
+                s_sta_fallback_armed = false;
+                /* Mode is now APSTA — the next esp_wifi_connect() below
+                 * uses the same STA creds, scanning may still hop the
+                 * channel, so fall through to the APSTA disruption guard. */
+                m = WIFI_MODE_APSTA;
+            }
+        }
+    }
+
     ESP_LOGI(TAG, "STA reconnect (next backoff %lu ms)",
              (unsigned long)s_reconnect_delay_ms);
+    /* APSTA shares one radio: the upcoming esp_wifi_connect() may scan
+     * channels to find the AP, dragging our SoftAP along and breaking
+     * existing TCP sockets on it. Drop tracked WS sessions BEFORE the
+     * hop so httpd doesn't sit polling dead sockets. (Browsers reopen
+     * automatically once the AP stabilises.) Pure STA mode has no AP
+     * clients to worry about. */
+    if (m == WIFI_MODE_APSTA && s_disruption_cb) {
+        /* Drop the WS sessions now, then defer the actual connect by a short
+         * drain window — realised as a second timer fire, NOT a vTaskDelay,
+         * because this callback runs in the shared esp_timer task and must
+         * never block it (that would stall every other esp_timer callback). */
+        s_disruption_cb();
+        s_reconnect_drain_pending = true;
+        esp_timer_stop(s_reconnect_timer);
+        esp_timer_start_once(s_reconnect_timer, (uint64_t)DISRUPTION_DRAIN_MS * 1000ULL);
+        return;
+    }
     esp_wifi_connect();
 }
 
@@ -126,7 +215,39 @@ static void schedule_reconnect(void)
 static void reset_reconnect_backoff(void)
 {
     s_reconnect_delay_ms = RECONNECT_DELAY_MIN_MS;
+    s_reconnect_drain_pending = false;
     if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+}
+
+/* Promote a stuck pure-STA configuration to APSTA: keep the configured
+ * STA creds (so the retry loop continues to try the real network) but
+ * also raise the recovery SoftAP. Used by the reconnect timer when the
+ * STA attempt has been failing past STA_FALLBACK_TIMEOUT_S. */
+static void promote_sta_to_apsta_fallback(void)
+{
+    app_config_t cfg;
+    app_config_get(&cfg);
+
+    wifi_config_t ap_wc;
+    fill_ap_config(&cfg, &ap_wc);
+
+    if (esp_wifi_set_mode(WIFI_MODE_APSTA) != ESP_OK) {
+        ESP_LOGW(TAG, "STA fallback: mode promotion failed");
+        return;
+    }
+    if (esp_wifi_set_config(WIFI_IF_AP, &ap_wc) != ESP_OK) {
+        ESP_LOGW(TAG, "STA fallback: AP config failed");
+        return;
+    }
+
+    strlcpy(s_active_ap_ssid, (const char *)ap_wc.ap.ssid, sizeof(s_active_ap_ssid));
+    s_ap_active = true;
+    /* is_up() will now return true via the AP, even while STA keeps
+     * retrying. wifi_mgr_current_ssid() still returns "" until STA gets
+     * an IP, so the UI shows "AP · <ssid>" with a good (green) signal. */
+    ESP_LOGW(TAG, "STA unreachable — recovery AP '%s' is up",
+             (const char *)ap_wc.ap.ssid);
+    event_log_emit(EV_WIFI_AP, 0, 0, "sta fallback");
 }
 
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -136,6 +257,8 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         switch (id) {
         case WIFI_EVENT_STA_START:
             /* First connect attempt is immediate; subsequent failures back off. */
+            s_sta_attempt_start_us = esp_timer_get_time();
+            s_sta_fallback_armed   = true;
             esp_wifi_connect();
             break;
         case WIFI_EVENT_STA_DISCONNECTED: {
@@ -150,9 +273,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGW(TAG, "STA disconnected (reason %u)", d ? d->reason : 0);
             if (s_state == WIFI_STATE_STA_CONNECTED) {
                 event_log_emit(EV_WIFI_STA_DISCONNECTED, 0, 0, NULL);
+                /* Re-arm the fallback timer for the post-connect outage
+                 * case (router rebooted, walked out of range, etc.) so
+                 * extended downtime brings the recovery AP up. */
+                s_sta_attempt_start_us = esp_timer_get_time();
+                s_sta_fallback_armed   = true;
             }
-            /* Preserve AP-up status: in hybrid the AP is still serving even
-             * while STA is failing. is_up() must keep returning true. */
+            /* Preserve AP-up status: once the recovery AP is up it keeps
+             * serving even while STA is failing. is_up() must stay true. */
             s_state = s_ap_active ? WIFI_STATE_AP : WIFI_STATE_STA_FAILED;
             if (!s_intentional_stop) schedule_reconnect();
             break;
@@ -178,6 +306,10 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
             ESP_LOGI(TAG, "STA got IP: " IPSTR, IP2STR(&e->ip_info.ip));
             s_state = WIFI_STATE_STA_CONNECTED;
             reset_reconnect_backoff();
+            /* Cycle resolved successfully — disarm the fallback so the next
+             * disconnect doesn't immediately trip it. */
+            s_sta_attempt_start_us = 0;
+            s_sta_fallback_armed   = false;
             event_log_emit(EV_WIFI_STA_CONNECTED, 0, 0, s_current_ssid);
             start_sntp_once();
         }
@@ -197,6 +329,14 @@ esp_err_t wifi_mgr_init(void)
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    /* World regulatory domain + 802.11d. "01" scans/associates across channels
+     * 1-13 — the default table omits 12/13, so an EU router parked there would
+     * be invisible — and with 802.11d on we then adopt the connected AP's exact
+     * power limits from its beacons. Must run after init, before start. */
+    esp_err_t cerr = esp_wifi_set_country_code("01", true);
+    if (cerr != ESP_OK)
+        ESP_LOGW(TAG, "set_country_code failed: %s", esp_err_to_name(cerr));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));
@@ -262,31 +402,27 @@ static esp_err_t configure_sta(const app_config_t *cfg)
     return ESP_OK;
 }
 
-/* APSTA: AP + STA simultaneously. AP is reachable instantly (no blocking
- * wait on STA), STA tries in the background and promotes the state to
- * STA_CONNECTED on got-IP. AP stays up so a user always has a fall-back
- * path even if STA later drops. */
-static esp_err_t configure_apsta(const app_config_t *cfg)
+/* Range-over-throughput RF profile for a mains-powered node behind an internal
+ * antenna — trade power budget and bandwidth for link robustness at the edge:
+ *   - PS_NONE: never park the modem between beacons. The STA default
+ *     WIFI_PS_MIN_MODEM wakes late and misses beacons on a marginal link, which
+ *     is what drops the association at range. ~+40 mA — nothing on a heater.
+ *   - max TX power pinned to the regulatory ceiling (80 = 20 dBm; the country
+ *     limit still clamps it, so this only ever raises, never overrides law).
+ *   - HT20: ~2-3 dB better RX sensitivity than HT40 and less interference-prone;
+ *     we have zero use for 40 MHz throughput here.
+ * Best-effort: these only refine an already-working radio, so a failure logs
+ * and continues rather than aborting startup. Must run AFTER esp_wifi_start() —
+ * TX power and bandwidth aren't settable while the radio is down. */
+static void apply_rf_profile(wifi_interface_t iface)
 {
-    wifi_config_t ap_wc;
-    fill_ap_config(cfg, &ap_wc);
-
-    wifi_config_t sta_wc = { 0 };
-    strlcpy((char *)sta_wc.sta.ssid, cfg->sta_ssid, sizeof(sta_wc.sta.ssid));
-    strlcpy((char *)sta_wc.sta.password, cfg->sta_pass, sizeof(sta_wc.sta.password));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP,  &ap_wc));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_wc));
-    strlcpy(s_current_ssid, cfg->sta_ssid, sizeof(s_current_ssid));
-    strlcpy(s_active_ap_ssid, (const char *)ap_wc.ap.ssid, sizeof(s_active_ap_ssid));
-    /* AP is the load-bearing reachability path until STA gets an IP; the
-     * IP_EVENT handler will lift state to STA_CONNECTED when that happens. */
-    s_state     = WIFI_STATE_AP;
-    s_ap_active = true;
-    ESP_LOGI(TAG, "APSTA up: AP='%s' STA='%s'",
-             (const char *)ap_wc.ap.ssid, cfg->sta_ssid);
-    return ESP_OK;
+    esp_err_t err;
+    if ((err = esp_wifi_set_ps(WIFI_PS_NONE)) != ESP_OK)
+        ESP_LOGW(TAG, "set_ps(NONE): %s", esp_err_to_name(err));
+    if ((err = esp_wifi_set_max_tx_power(80)) != ESP_OK)
+        ESP_LOGW(TAG, "set_max_tx_power: %s", esp_err_to_name(err));
+    if ((err = esp_wifi_set_bandwidth(iface, WIFI_BW20)) != ESP_OK)
+        ESP_LOGW(TAG, "set_bandwidth(HT20): %s", esp_err_to_name(err));
 }
 
 esp_err_t wifi_mgr_start(void)
@@ -306,21 +442,18 @@ esp_err_t wifi_mgr_start(void)
     if (mode == WIFI_ROLE_AP || cfg.sta_ssid[0] == '\0') {
         configure_ap(&cfg);
         ESP_ERROR_CHECK(esp_wifi_start());
+        apply_rf_profile(WIFI_IF_AP);
         s_state = WIFI_STATE_AP;
         event_log_emit(EV_WIFI_AP, 0, 0, NULL);
         return ESP_OK;
     }
 
-    if (mode == WIFI_ROLE_STA) {
-        configure_sta(&cfg);
-        ESP_ERROR_CHECK(esp_wifi_start());
-        return ESP_OK;
-    }
-
-    /* HYBRID — AP + STA in parallel, no blocking on app_main. */
-    configure_apsta(&cfg);
+    /* STA — join the configured network. If it can't get an IP within
+     * sta_fallback_seconds, the event handler promotes to APSTA and brings
+     * up a recovery AP (promote_sta_to_apsta_fallback). */
+    configure_sta(&cfg);
     ESP_ERROR_CHECK(esp_wifi_start());
-    event_log_emit(EV_WIFI_AP, 0, 0, "hybrid");
+    apply_rf_profile(WIFI_IF_STA);
     return ESP_OK;
 }
 
@@ -421,7 +554,12 @@ int wifi_mgr_scan(wifi_scan_entry_t *entries, int max_entries)
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
-        if (restored_needed) esp_wifi_set_mode(prev_mode);
+        /* Mode-restore may hop the AP channel back — close any WS clients
+         * that reconnected during our short APSTA promotion. */
+        if (restored_needed) {
+            fire_disruption();
+            esp_wifi_set_mode(prev_mode);
+        }
         return 0;
     }
     uint16_t n = 0;
@@ -443,7 +581,11 @@ int wifi_mgr_scan(wifi_scan_entry_t *entries, int max_entries)
             free(recs);
         }
     }
-    if (restored_needed) esp_wifi_set_mode(prev_mode);
+    if (restored_needed) {
+        /* Same reason as the early-return path above. */
+        fire_disruption();
+        esp_wifi_set_mode(prev_mode);
+    }
     return out;
 }
 
@@ -543,6 +685,9 @@ esp_err_t wifi_mgr_test_sta(const char *ssid, const char *password,
     esp_wifi_disconnect();
     esp_wifi_set_config(WIFI_IF_STA, &prev_sta);
     if (promoted) {
+        /* Mode flip back to AP-only can hop the channel and break any WS
+         * client that re-opened during the 12 s test window. */
+        fire_disruption();
         esp_wifi_set_mode(prev_mode);
         /* Coming back from APSTA→AP: refresh the cached active AP SSID,
          * the value didn't change but s_ap_active is still set. */

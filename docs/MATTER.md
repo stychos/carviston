@@ -8,7 +8,7 @@ heater-mode/management clusters, per-probe sensors, and fault events.
 
 | Phase | Scope | State |
 |-------|-------|-------|
-| 1 | Partition table reshape (3 MB → **4 MB** OTA slots, 7.75 MB SPIFFS) | done |
+| 1 | Partition table reshape (3 MB → **4 MB** OTA slots; web bundle was SPIFFS, since embedded in-firmware — no web partition) | done |
 | 2 | Build flag, matter_node skeleton, OnOff + Thermostat + TempMeas bridge to heater_control | done |
 | 3 | WaterHeaterMode + WaterHeaterManagement clusters | done |
 | 4 | Probe-sensor endpoints (EP 2-5) | done |
@@ -119,23 +119,25 @@ Writes from the controller hit `heater_set_*()` via the
 
 ### Safety endpoint (EP 6)
 
-A `GenericSwitch` (`0x000F`) latching switch with **5 positions** mapping
+A `GenericSwitch` (`0x000F`) latching switch with **3 positions** mapping
 one-to-one onto `safety_status_t`:
 
 | CurrentPosition | safety_status_t            | Meaning                                           |
 |-----------------|----------------------------|---------------------------------------------------|
 | 0               | `SAFETY_OK`                | Heater is normal                                  |
-| 1               | `SAFETY_FAULT_CUTOFF`      | KSD301 hardware cutoff has opened the JD-VCC rail |
-| 2               | `SAFETY_FAULT_PROBE`       | Probe disagreement or open / short                |
-| 3               | `SAFETY_FAULT_OVERTEMP`    | Water exceeded the 95 °C firmware soft limit      |
-| 4               | `SAFETY_FAULT_NO_PROBES`   | Every probe is faulted, no valid reading          |
+| 1               | `SAFETY_FAULT_OVERTEMP`    | A tank exceeded the 90 °C firmware soft limit     |
+| 2               | `SAFETY_FAULT_NO_PROBES`   | Every tank is faulted, no valid reading           |
+
+A single tank's probe failing is handled per-tank (the healthy tank keeps
+heating) and shows up as that tank's `TemperatureSensor` endpoint going null,
+not as a safety position. Faults auto-recover once the condition clears.
 
 The cluster is configured with `FeatureMap = 0x01` (LatchingSwitch) so a
 `SwitchLatched` event fires on every transition. Apple Home / Google Home
 let users wire these events into automations:
 
 - *"If Carviston safety latches to anything except 0 → push notification."*
-- *"If safety position is 1 (cutoff) for more than 30 min → email me."*
+- *"If safety position is 1 (over-temp) for more than 30 min → email me."*
 
 A Fixed Label cluster (`name = "Safety status"`) keeps the endpoint legible
 in app UIs. The current latched position is mirrored in `CurrentPosition`

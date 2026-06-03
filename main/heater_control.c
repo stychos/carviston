@@ -20,7 +20,8 @@
 
 static const char *TAG = "heater";
 
-#define TICK_MS  1000
+#define TICK_MS  1000   /* heavy control cadence (read temp, evaluate, command) */
+#define INPUT_POLL_MS  50   /* button/combo servicing cadence — keeps +/- snappy */
 
 static SemaphoreHandle_t s_lock;
 static heater_state_t s_state;
@@ -126,37 +127,89 @@ void heater_atomic_swap_mode(heating_mode_t new_mode, heating_mode_t *prev_out)
     }
 }
 
+/* Persist the latest master on/off so restore_power_on_boot can bring it back
+ * after a reboot. Always recorded (cheap: coalesced by app_config_save_deferred
+ * and only at human cadence) so enabling the option later restores the real
+ * current state. Must be called WITHOUT s_lock held — app_config has its own
+ * mutex. */
+static void persist_power_state(bool on)
+{
+    app_config_t cfg;
+    app_config_get(&cfg);
+    if (cfg.last_power_state != on) {
+        cfg.last_power_state = on;
+        app_config_save_deferred(&cfg);
+    }
+}
+
 void heater_set_master_enabled(bool on)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool prev = s_state.master_enabled;
-    s_state.master_enabled = on;
+    bool prev_any = s_state.element_enabled[0] || s_state.element_enabled[1];
+    s_state.element_enabled[0] = on;
+    s_state.element_enabled[1] = on;
+    s_state.master_enabled     = on;
     if (!on) reset_mode_state();
     xSemaphoreGive(s_lock);
     if (!on) relays_all_off();
-    if (prev != on) event_log_emit(on ? EV_MASTER_ON : EV_MASTER_OFF, 0, 0, NULL);
+    if (prev_any != on) event_log_emit(on ? EV_MASTER_ON : EV_MASTER_OFF, 0, 0, NULL);
+    persist_power_state(on);
 }
 
 void heater_toggle_master(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool now = !s_state.master_enabled;
-    s_state.master_enabled = now;
-    if (!now) reset_mode_state();
+    bool any = s_state.element_enabled[0] || s_state.element_enabled[1];
     xSemaphoreGive(s_lock);
-    if (!now) relays_all_off();
-    event_log_emit(now ? EV_MASTER_ON : EV_MASTER_OFF, 0, 0, NULL);
+    heater_set_master_enabled(!any);
+}
+
+void heater_set_element_enabled(uint8_t channel, bool on)
+{
+    if (channel >= 2) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_state.element_enabled[channel] == on) {
+        xSemaphoreGive(s_lock);
+        return;
+    }
+    bool prev_any = s_state.element_enabled[0] || s_state.element_enabled[1];
+    s_state.element_enabled[channel] = on;
+    bool now_any = s_state.element_enabled[0] || s_state.element_enabled[1];
+    s_state.master_enabled = now_any;
+    if (!now_any) reset_mode_state();
+    xSemaphoreGive(s_lock);
+    if (!now_any) relays_all_off();
+    /* Don't emit EV_HEATER_ON/OFF here: that event means "a relay actually
+     * energised", which only the control-loop tick can decide (enabling an
+     * element while in standby closes no relay). Emitting it on the user's
+     * enable-toggle too would give the log two producers of the same event
+     * with the same args. We log only the master on/off transition. */
+    if (prev_any != now_any) {
+        event_log_emit(now_any ? EV_MASTER_ON : EV_MASTER_OFF, 0, 0, NULL);
+        persist_power_state(now_any);
+    }
+}
+
+void heater_toggle_element(uint8_t channel)
+{
+    if (channel >= 2) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool was = s_state.element_enabled[channel];
+    xSemaphoreGive(s_lock);
+    heater_set_element_enabled(channel, !was);
 }
 
 void heater_clear_safety_fault(void)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool was_on = s_state.master_enabled;
-    s_state.master_enabled = false;
+    bool was_on = s_state.element_enabled[0] || s_state.element_enabled[1];
+    s_state.element_enabled[0] = false;
+    s_state.element_enabled[1] = false;
+    s_state.master_enabled     = false;
     reset_mode_state();
     xSemaphoreGive(s_lock);
     relays_all_off();
-    if (was_on) event_log_emit(EV_MASTER_OFF, 0, 0, NULL);
+    if (was_on) { event_log_emit(EV_MASTER_OFF, 0, 0, NULL); persist_power_state(false); }
     /* Drop the latch only AFTER we've forced master off and dropped relays.
      * If the underlying condition still holds, the next safety_evaluate()
      * tick will re-latch before any heating decision is made. */
@@ -173,32 +226,46 @@ void heater_get_state(heater_state_t *out)
 
 /* --- control logic --- */
 
-/* Returns true if we should be in "heating needed" cycle. Implements hysteresis. */
-static bool update_heating_phase(bool currently_heating, float water_c,
+/* Returns true if a tank at `temp_c` should be in a "heating needed" cycle.
+ * Implements hysteresis off the tank's own current relay state. */
+static bool update_heating_phase(bool currently_heating, float temp_c,
                                  uint8_t target, uint8_t hyst)
 {
-    if (isnan(water_c)) return false;
+    if (isnan(temp_c)) return false;
     if (currently_heating) {
-        return water_c < (float)target;
+        return temp_c < (float)target;
     }
-    return water_c <= (float)target - (float)hyst;
+    return temp_c <= (float)target - (float)hyst;
 }
 
-/* Runs the mode state machine for one tick. Caller holds s_lock. */
-static void step_mode(const app_config_t *cfg, bool heating_needed,
+/* Each relay is bound to its own tank: relay/tank 0 = inlet, 1 = outlet.
+ * `wants[i]` is set by the caller iff tank i is enabled, healthy, and below
+ * target (its own hysteresis). The mode here is purely a POWER POLICY layered
+ * on top — it never forces an element on whose tank doesn't want heat, so a
+ * tank that has reached target stops while the colder tank keeps heating.
+ *
+ *   SUPER_FAST / FAST : both elements may run at once (FAST adds an on/rest
+ *                       duty cycle); each still gated by its own tank.
+ *   OPTIMAL / ECO     : at most ONE element at a time (caps current draw),
+ *                       alternating between tanks; ECO adds a rest phase.
+ *                       If the scheduled tank is already at target, the slot
+ *                       is handed to the other tank that still wants heat.
+ *
+ * Runs the mode state machine for one tick. Caller holds s_lock. */
+static void step_mode(const app_config_t *cfg, const bool wants[RELAY_COUNT],
                       bool out_relays[RELAY_COUNT], const char **phase_name)
 {
     out_relays[0] = false;
     out_relays[1] = false;
     *phase_name = "idle";
 
-    if (!heating_needed) {
-        /* Target reached / outside hysteresis: pause but PRESERVE the mode
-         * state. When water cools and heating resumes, OPTIMAL continues the
-         * current heater's remaining slot, ECO continues its current phase,
-         * FAST resumes its current on/rest window. Resetting here would
-         * restart the alternation pattern each cycle and (for ECO) lose any
-         * mandated rest period. */
+    bool any_want = wants[0] || wants[1];
+    if (!any_want) {
+        /* Both tanks at target: pause but PRESERVE the mode state. When a tank
+         * cools and heating resumes, OPTIMAL continues the current slot, ECO
+         * continues its phase, FAST resumes its on/rest window. Resetting here
+         * would restart the alternation pattern each cycle and (for ECO) lose
+         * any mandated rest period. */
         *phase_name = "target reached";
         return;
     }
@@ -227,13 +294,13 @@ static void step_mode(const app_config_t *cfg, bool heating_needed,
 
     switch (s_state.mode) {
     case HEATING_MODE_SUPER_FAST:
-        out_relays[0] = true;
-        out_relays[1] = true;
+        out_relays[0] = wants[0];
+        out_relays[1] = wants[1];
         *phase_name = "heating";
         break;
 
     case HEATING_MODE_FAST: {
-        /* phase 0: both on for N min. phase 1: rest R min.
+        /* phase 0: both eligible for N min. phase 1: rest R min.
          * Boundary fires only when an actual phase runs out — the entry
          * block above pre-loaded fast_on_min for the opening tick. */
         if (s_mode_state.phase_seconds_left == 0) {
@@ -243,8 +310,8 @@ static void step_mode(const app_config_t *cfg, bool heating_needed,
             s_mode_state.phase_seconds_left = (uint32_t)mins * 60u;
         }
         if (s_mode_state.phase == 0) {
-            out_relays[0] = true;
-            out_relays[1] = true;
+            out_relays[0] = wants[0];
+            out_relays[1] = wants[1];
             *phase_name = "heating";
         } else {
             *phase_name = "rest";
@@ -257,13 +324,21 @@ static void step_mode(const app_config_t *cfg, bool heating_needed,
             s_mode_state.current_relay ^= 1;
             s_mode_state.phase_seconds_left = (uint32_t)cfg->optimal_swap_min * 60u;
         }
-        out_relays[s_mode_state.current_relay] = true;
-        *phase_name = (s_mode_state.current_relay == 0) ? "heater 1" : "heater 2";
+        /* Serve the scheduled tank; if it's already satisfied, give its slot
+         * to the other tank rather than idling. */
+        uint8_t r = s_mode_state.current_relay;
+        if (!wants[r]) r ^= 1;
+        if (wants[r]) {
+            out_relays[r] = true;
+            *phase_name = (r == 0) ? "inlet tank" : "outlet tank";
+        } else {
+            *phase_name = "target reached";
+        }
         break;
     }
 
     case HEATING_MODE_ECO: {
-        /* phase 0: heater current_relay on for N min. phase 1: rest R min, then swap. */
+        /* phase 0: one tank on for N min. phase 1: rest R min, then swap. */
         if (s_mode_state.phase_seconds_left == 0) {
             if (s_mode_state.phase == 0) {
                 s_mode_state.phase = 1;
@@ -275,8 +350,14 @@ static void step_mode(const app_config_t *cfg, bool heating_needed,
             }
         }
         if (s_mode_state.phase == 0) {
-            out_relays[s_mode_state.current_relay] = true;
-            *phase_name = (s_mode_state.current_relay == 0) ? "heater 1" : "heater 2";
+            uint8_t r = s_mode_state.current_relay;
+            if (!wants[r]) r ^= 1;
+            if (wants[r]) {
+                out_relays[r] = true;
+                *phase_name = (r == 0) ? "inlet tank" : "outlet tank";
+            } else {
+                *phase_name = "target reached";
+            }
         } else {
             *phase_name = "rest";
         }
@@ -420,6 +501,7 @@ static void control_task(void *arg)
      * rather than jittering across a 1 s window. */
     static int64_t combo_both_held_since_us = 0;
     static bool    combo_fired              = false;
+    int64_t next_control_us = 0;
 
     for (;;) {
         /* drain button events (non-blocking) */
@@ -470,6 +552,18 @@ static void control_task(void *arg)
             }
         }
 
+        /* Buttons + combo + pairing (above) are serviced every INPUT_POLL_MS so
+         * +/- and the panel stay responsive. The heavy control block below
+         * (temperature read alone takes a few hundred ms) runs only once per
+         * TICK_MS — draining buttons at that 1 Hz cadence is what made rapid
+         * +/- presses feel laggy. */
+        int64_t loop_now_us = esp_timer_get_time();
+        if (loop_now_us < next_control_us) {
+            vTaskDelay(pdMS_TO_TICKS(INPUT_POLL_MS));
+            continue;
+        }
+        next_control_us = loop_now_us + (int64_t)TICK_MS * 1000;
+
         app_config_t cfg;
         app_config_get(&cfg);
 
@@ -482,19 +576,36 @@ static void control_task(void *arg)
         s_state.safety   = safety;
         s_state.target_c = cfg.target_temp_c;
         s_state.mode     = cfg.heating_mode;
+        /* Shower-ready tracks the OUTLET tank (the delivered water) alone, not
+         * the whole-heater average — a hot outlet means a usable shower even if
+         * the inlet tank is still recovering. NaN (faulted outlet) → not ready. */
         s_state.shower_ready =
-            !temp.all_fault && temp.water_c >= (float)cfg.shower_ready_c;
+            !isnan(temp.outlet_c) && temp.outlet_c >= (float)cfg.shower_ready_c;
 
         bool relays_cmd[RELAY_COUNT] = { false, false };
-        bool ok_to_heat = s_state.master_enabled && safety == SAFETY_OK;
-        bool currently_heating = s_state.heater_active[0] || s_state.heater_active[1];
-        bool heating_needed = ok_to_heat &&
-            update_heating_phase(currently_heating, temp.water_c,
-                                 cfg.target_temp_c, cfg.hysteresis_c);
+        bool any_enabled = s_state.element_enabled[0] || s_state.element_enabled[1];
+        s_state.master_enabled = any_enabled;
+        bool ok_to_heat = any_enabled && safety == SAFETY_OK;
+
+        /* Per-tank demand: each tank runs its own thermostat against the shared
+         * target using its own regulation NTC and its own hysteresis state
+         * (the relay it's currently driving). A disabled or faulted tank never
+         * demands heat — so a sensor fault on one tank stops that element while
+         * the healthy tank keeps heating. step_mode() then layers the mode's
+         * power policy on top without ever forcing a satisfied tank on. */
+        bool wants[RELAY_COUNT] = { false, false };
+        for (int i = 0; i < RELAY_COUNT; ++i) {
+            wants[i] = ok_to_heat && s_state.element_enabled[i] &&
+                       !temp.tank[i].fault &&
+                       update_heating_phase(s_state.heater_active[i],
+                                            temp.tank[i].regulation_c,
+                                            cfg.target_temp_c, cfg.hysteresis_c);
+        }
+        bool heating_needed = wants[0] || wants[1];
 
         const char *phase_name = "idle";
         if (ok_to_heat) {
-            step_mode(&cfg, heating_needed, relays_cmd, &phase_name);
+            step_mode(&cfg, wants, relays_cmd, &phase_name);
         } else {
             reset_mode_state();
         }
@@ -549,7 +660,7 @@ static void control_task(void *arg)
         led.shower_ready      = s_state.shower_ready;
         leds_publish_state(&led);
 
-        vTaskDelay(pdMS_TO_TICKS(TICK_MS));
+        vTaskDelay(pdMS_TO_TICKS(INPUT_POLL_MS));
     }
 }
 
@@ -561,20 +672,31 @@ esp_err_t heater_control_init(void)
     app_config_t cfg;
     app_config_get(&cfg);
 
+    /* Default is OFF: don't run heaters before the user acks (see CLAUDE.md).
+     * With restore_power_on_boot enabled we instead re-apply the last known
+     * master state, so the heater survives a reboot / power cut. Safety still
+     * gates the relays in the control tick, so restoring ON can't bypass a
+     * fault — it just means heating resumes once the probes read OK. */
+    bool restore = cfg.restore_power_on_boot && cfg.last_power_state;
     memset(&s_state, 0, sizeof(s_state));
-    s_state.master_enabled = false;       /* require explicit user power-on */
+    s_state.master_enabled     = restore;
+    s_state.element_enabled[0] = restore;
+    s_state.element_enabled[1] = restore;
     s_state.target_c       = cfg.target_temp_c;
     s_state.mode           = cfg.heating_mode;
     s_state.phase_name     = "idle";
     /* Temperature reading is "unknown" until temperature.c produces one — NaN
      * propagates correctly through Matter (nullable int16 → Matter null) and
      * the LED panel, where 0 °C would incorrectly enable the 40 °C LED. */
-    s_state.temp.water_c             = NAN;
-    s_state.temp.probe[0].regulation_c = NAN;
-    s_state.temp.probe[0].safety_c     = NAN;
-    s_state.temp.probe[1].regulation_c = NAN;
-    s_state.temp.probe[1].safety_c     = NAN;
+    s_state.temp.water_c                    = NAN;
+    s_state.temp.outlet_c                   = NAN;
+    s_state.temp.max_c                      = NAN;
+    s_state.temp.tank[TANK_INLET].regulation_c  = NAN;
+    s_state.temp.tank[TANK_INLET].safety_c      = NAN;
+    s_state.temp.tank[TANK_OUTLET].regulation_c = NAN;
+    s_state.temp.tank[TANK_OUTLET].safety_c     = NAN;
     reset_mode_state();
+    if (restore) event_log_emit(EV_MASTER_ON, 0, 0, "restored");
 
     if (xTaskCreate(control_task, "heater", 4096, NULL, 7, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;

@@ -22,6 +22,7 @@ extern "C" {
 #define APP_CFG_TOKEN_BYTES        32   /* session token raw bytes */
 #define APP_CFG_WIFI_SSID_MAX      33
 #define APP_CFG_WIFI_PASS_MAX      65
+#define APP_CFG_DEVICE_NAME_MAX    32   /* user-facing display name shown in the UI */
 
 typedef enum {
     HEATING_MODE_SUPER_FAST = 0, /* both heaters continuous until target */
@@ -47,14 +48,16 @@ typedef enum {
 } temp_unit_t;
 
 typedef enum {
-    WIFI_ROLE_AP = 0,
-    WIFI_ROLE_STA,
-    WIFI_ROLE_HYBRID,                /* try STA for N seconds, fall back to AP */
+    WIFI_ROLE_AP = 0,                /* SoftAP only */
+    WIFI_ROLE_STA,                   /* join a network; recovery AP via sta_fallback_* */
 } wifi_role_t;
 
 typedef struct {
     /* --- versioning --- */
     uint16_t version;                /* config schema version */
+
+    /* --- identity --- */
+    char device_name[APP_CFG_DEVICE_NAME_MAX];  /* display name in the web UI; empty → "Carviston" */
 
     /* --- first-boot / auth --- */
     bool configured;                 /* password has been set */
@@ -100,7 +103,8 @@ typedef struct {
     char  sta_pass[APP_CFG_WIFI_PASS_MAX];
     char  ap_ssid[APP_CFG_WIFI_SSID_MAX];   /* if empty, derived from MAC */
     char  ap_pass[APP_CFG_WIFI_PASS_MAX];   /* if empty, AP is open (first boot) */
-    uint16_t hybrid_sta_seconds;            /* scan/STA window before AP fallback */
+    bool     sta_fallback_enabled;          /* in pure STA mode: bring up the recovery AP after sta_fallback_seconds without GOT_IP */
+    uint16_t sta_fallback_seconds;          /* timeout (s) before the fallback AP comes up; default 60 */
 
     /* --- UX timings --- */
     uint16_t long_press_ms;                 /* button long-press threshold (default 1500) */
@@ -108,6 +112,13 @@ typedef struct {
 
     /* --- benchmark --- */
     uint32_t bench_resume_threshold_s;      /* max seconds between reboot and resume; default 600 */
+
+    /* --- power-state restore --- */
+    bool restore_power_on_boot;             /* true (default): re-apply last_power_state at boot so
+                                               the heater survives a reboot/power cut. false: front
+                                               panel stays dark until the user presses POWER. */
+    bool last_power_state;                  /* most recent master_enabled, persisted so a restore
+                                               brings the heater back to where the user left it. */
 
 } app_config_t;
 
@@ -136,6 +147,8 @@ esp_err_t app_config_factory_reset(void);
 heating_mode_t app_config_get_heating_mode(void);
 uint8_t        app_config_get_target_temp(void);
 bool           app_config_is_configured(void);
+/* Copy the display name (or "Carviston" if unset) into buf. */
+void           app_config_get_device_name(char *buf, size_t len);
 bool           app_config_dashboard_locked(void);
 
 /* Returns "carviston-xxxxxx" using last 3 bytes of base MAC.

@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "esp_app_desc.h"
 #include "esp_app_format.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -22,13 +23,10 @@
 #include "heater_control.h"
 #include "ota.h"
 #include "safety.h"
-#include "web_fs.h"
+#include "web_assets.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "web";
-
-extern const uint8_t setup_html_start[] asm("_binary_setup_html_start");
-extern const uint8_t setup_html_end[]   asm("_binary_setup_html_end");
 
 static httpd_handle_t s_httpd;
 
@@ -128,63 +126,57 @@ static bool require_dashboard(httpd_req_t *req)
 
 /* ---------- static / index ---------- */
 
-static esp_err_t send_file_from_spiffs(httpd_req_t *req, const char *path,
-                                       const char *mime)
-{
-    char full[80];
-    snprintf(full, sizeof(full), "/web%s", path);
-    FILE *f = fopen(full, "rb");
-    if (!f) return ESP_FAIL;
-    struct stat st;
-    if (stat(full, &st) != 0) { fclose(f); return ESP_FAIL; }
-    httpd_resp_set_type(req, mime);
-    /* gz-precompressed bundles can set Content-Encoding via .gz suffix later. */
-    char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) { fclose(f); return ESP_FAIL; }
-    }
-    fclose(f);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
-}
-
-static const char *guess_mime(const char *uri)
-{
-    const char *dot = strrchr(uri, '.');
-    if (!dot) return "application/octet-stream";
-    if (!strcasecmp(dot, ".html")) return "text/html; charset=utf-8";
-    if (!strcasecmp(dot, ".js"))   return "application/javascript";
-    if (!strcasecmp(dot, ".css"))  return "text/css";
-    if (!strcasecmp(dot, ".json")) return "application/json";
-    if (!strcasecmp(dot, ".svg"))  return "image/svg+xml";
-    if (!strcasecmp(dot, ".png"))  return "image/png";
-    if (!strcasecmp(dot, ".ico"))  return "image/x-icon";
-    return "application/octet-stream";
-}
-
-static esp_err_t serve_embedded_index(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, (const char *)setup_html_start,
-                           setup_html_end - setup_html_start);
-}
-
+/* Serve the Vue frontend straight from the firmware-embedded archive (see
+ * web_assets.c). No filesystem, no I/O — the bytes sit in memory-mapped flash.
+ * Unknown non-API GETs fall back to index.html (SPA-style routing). */
 static esp_err_t static_get(httpd_req_t *req)
 {
-    /* If SPIFFS bundle is present, serve from it. Otherwise: every non-API
-     * GET resolves to the embedded fallback (SPA-style routing). */
-    if (web_fs_has_bundle()) {
-        const char *uri = req->uri;
-        if (strcmp(uri, "/") == 0) uri = "/index.html";
-        if (send_file_from_spiffs(req, uri, guess_mime(uri)) == ESP_OK) return ESP_OK;
-        /* SPA fallback to index */
-        return send_file_from_spiffs(req, "/index.html", "text/html; charset=utf-8");
+    /* Take just the path, dropping any query string ("/?v=123" → "/"). */
+    char path[160];
+    size_t n = 0;
+    for (const char *u = req->uri; *u && *u != '?' && n < sizeof(path) - 1; ++u)
+        path[n++] = *u;
+    path[n] = '\0';
+    if (path[0] == '\0' || strcmp(path, "/") == 0) strcpy(path, "/index.html");
+
+    const web_asset_t *a = web_assets_get(path);
+    if (!a) a = web_assets_index();          /* SPA fallback */
+    if (!a) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "not found", HTTPD_RESP_USE_STRLEN);
     }
-    return serve_embedded_index(req);
+
+    httpd_resp_set_type(req, a->mime);
+    if (a->gzip) httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    /* Cache policy keys off the SERVED asset's own path, never the requested
+     * URL: a miss for a stale /assets/<oldhash>.js falls back to index.html,
+     * and caching that HTML body immutably under the .js URL would poison the
+     * browser for a year. Hashed asset filenames (a->path under /assets/) are
+     * content-addressed → cache hard; index.html and any SPA fallback must
+     * stay fresh so they always reference the current asset names. */
+    httpd_resp_set_hdr(req, "Cache-Control",
+                       strncmp(a->path, "/assets/", 8) == 0
+                           ? "public, max-age=31536000, immutable"
+                           : "no-cache");
+    return httpd_resp_send(req, (const char *)a->data, a->len);
 }
 
 /* ---------- auth API ---------- */
+
+/* Short, build-unique identity of the running firmware, derived from the app
+ * ELF SHA-256. The OTA dashboard captures this before an update and polls
+ * until it sees a DIFFERENT value, so it can tell a real flash apart from a
+ * device that merely came back on the OLD image (e.g. an aborted upload). */
+static const char *running_fw_id(void)
+{
+    static char id[9];
+    if (id[0] == '\0') {
+        const esp_app_desc_t *d = esp_app_get_description();
+        for (int i = 0; i < 4; ++i) snprintf(id + i * 2, 3, "%02x", d->app_elf_sha256[i]);
+    }
+    return id;
+}
 
 static esp_err_t api_auth_status(httpd_req_t *req)
 {
@@ -195,6 +187,7 @@ static esp_err_t api_auth_status(httpd_req_t *req)
     cJSON_AddBoolToObject(o, "configured",      app_config_is_configured());
     cJSON_AddBoolToObject(o, "authenticated",   authed);
     cJSON_AddBoolToObject(o, "dashboard_locked", app_config_dashboard_locked());
+    cJSON_AddStringToObject(o, "fw", running_fw_id());
     return send_json(req, o, 200);
 }
 
@@ -252,24 +245,34 @@ static cJSON *state_json(void)
     heater_state_t st;
     heater_get_state(&st);
 
+    char devname[APP_CFG_DEVICE_NAME_MAX];
+    app_config_get_device_name(devname, sizeof(devname));
+
     cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "device_name", devname);
     cJSON_AddNumberToObject(o, "target_c", st.target_c);
     cJSON_AddNumberToObject(o, "mode", st.mode);
     cJSON_AddBoolToObject(o, "master_enabled", st.master_enabled);
+    cJSON *elements = cJSON_CreateArray();
+    cJSON_AddItemToArray(elements, cJSON_CreateBool(st.element_enabled[0]));
+    cJSON_AddItemToArray(elements, cJSON_CreateBool(st.element_enabled[1]));
+    cJSON_AddItemToObject(o, "element_enabled", elements);
     if (!st.temp.all_fault) {
         cJSON_AddNumberToObject(o, "water_c", st.temp.water_c);
     } else {
         cJSON_AddNullToObject(o, "water_c");
     }
-    cJSON *probes = cJSON_CreateArray();
-    for (int i = 0; i < PROBE_COUNT; ++i) {
+    static const char *const tank_names[TANK_COUNT] = { "Inlet tank", "Outlet tank" };
+    cJSON *tanks = cJSON_CreateArray();
+    for (int i = 0; i < TANK_COUNT; ++i) {
         cJSON *p = cJSON_CreateObject();
-        cJSON_AddNumberToObject(p, "regulation_c", st.temp.probe[i].regulation_c);
-        cJSON_AddNumberToObject(p, "safety_c",     st.temp.probe[i].safety_c);
-        cJSON_AddBoolToObject(p, "fault",          st.temp.probe[i].fault);
-        cJSON_AddItemToArray(probes, p);
+        cJSON_AddStringToObject(p, "name",         tank_names[i]);
+        cJSON_AddNumberToObject(p, "regulation_c", st.temp.tank[i].regulation_c);
+        cJSON_AddNumberToObject(p, "safety_c",     st.temp.tank[i].safety_c);
+        cJSON_AddBoolToObject(p, "fault",          st.temp.tank[i].fault);
+        cJSON_AddItemToArray(tanks, p);
     }
-    cJSON_AddItemToObject(o, "probes", probes);
+    cJSON_AddItemToObject(o, "tanks", tanks);
 
     cJSON *heaters = cJSON_CreateArray();
     cJSON_AddItemToArray(heaters, cJSON_CreateBool(st.heater_active[0]));
@@ -300,6 +303,7 @@ static esp_err_t api_state(httpd_req_t *req)
 static cJSON *config_to_json(const app_config_t *c)
 {
     cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "device_name", c->device_name);
     cJSON_AddNumberToObject(o, "heating_mode", c->heating_mode);
     cJSON_AddNumberToObject(o, "target_c", c->target_temp_c);
     cJSON_AddNumberToObject(o, "shower_ready_c", c->shower_ready_c);
@@ -318,10 +322,12 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddNumberToObject(o, "wifi_mode", c->wifi_mode);
     cJSON_AddStringToObject(o, "sta_ssid", c->sta_ssid);
     cJSON_AddStringToObject(o, "ap_ssid", c->ap_ssid);
-    cJSON_AddNumberToObject(o, "hybrid_sta_seconds", c->hybrid_sta_seconds);
+    cJSON_AddBoolToObject  (o, "sta_fallback_enabled", c->sta_fallback_enabled);
+    cJSON_AddNumberToObject(o, "sta_fallback_seconds", c->sta_fallback_seconds);
     cJSON_AddNumberToObject(o, "long_press_ms", c->long_press_ms);
     cJSON_AddNumberToObject(o, "preview_release_ms", c->preview_release_ms);
     cJSON_AddNumberToObject(o, "bench_resume_threshold_s", c->bench_resume_threshold_s);
+    cJSON_AddBoolToObject  (o, "restore_power_on_boot", c->restore_power_on_boot);
     /* never serialise the AP/STA passwords back to client; just signal "set" */
     cJSON_AddBoolToObject(o, "sta_pass_set",    c->sta_pass[0] != '\0');
     cJSON_AddBoolToObject(o, "ap_pass_set",     c->ap_pass[0]  != '\0');
@@ -343,6 +349,14 @@ static esp_err_t api_config_get(httpd_req_t *req)
     app_config_t c;
     app_config_get(&c);
     return send_json(req, config_to_json(&c), 200);
+}
+
+static void delayed_wifi_restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(400));
+    wifi_mgr_restart();
+    vTaskDelete(NULL);
 }
 
 static esp_err_t api_config_put(httpd_req_t *req)
@@ -385,14 +399,30 @@ static esp_err_t api_config_put(httpd_req_t *req)
     UPDATE_NUM(power_led_mode,     "power_led_mode",   0, 1);
     UPDATE_NUM(eco_led_mode,       "eco_led_mode",     0, 1);
     UPDATE_NUM(dashboard_unit,     "dashboard_unit",   0, 1);
-    UPDATE_NUM(wifi_mode,          "wifi_mode",        0, 2);
-    UPDATE_NUM(hybrid_sta_seconds, "hybrid_sta_seconds", 5, 600);
+    UPDATE_NUM(wifi_mode,          "wifi_mode",        0, 1);
+    UPDATE_NUM(sta_fallback_seconds, "sta_fallback_seconds", 10, 600);
+    v = cJSON_GetObjectItemCaseSensitive(body, "sta_fallback_enabled");
+    if (cJSON_IsBool(v)) cfg.sta_fallback_enabled = cJSON_IsTrue(v);
     UPDATE_NUM(long_press_ms,           "long_press_ms",           500, 5000);
     UPDATE_NUM(preview_release_ms,      "preview_release_ms",      500, 10000);
     UPDATE_NUM(bench_resume_threshold_s,"bench_resume_threshold_s", 0,   86400);
 
     v = cJSON_GetObjectItemCaseSensitive(body, "dashboard_locked");
     if (cJSON_IsBool(v)) cfg.dashboard_locked = cJSON_IsTrue(v);
+
+    v = cJSON_GetObjectItemCaseSensitive(body, "restore_power_on_boot");
+    if (cJSON_IsBool(v)) cfg.restore_power_on_boot = cJSON_IsTrue(v);
+
+    v = cJSON_GetObjectItemCaseSensitive(body, "device_name");
+    if (cJSON_IsString(v) && v->valuestring) {
+        /* Trim leading/trailing spaces; an all-blank name stores empty so the
+         * UI falls back to the default rather than showing a blank header. */
+        const char *p = v->valuestring;
+        while (*p == ' ') p++;
+        strlcpy(cfg.device_name, p, sizeof(cfg.device_name));
+        for (int i = (int)strlen(cfg.device_name) - 1; i >= 0 && cfg.device_name[i] == ' '; --i)
+            cfg.device_name[i] = '\0';
+    }
 
     v = cJSON_GetObjectItemCaseSensitive(body, "sta_ssid");
     if (cJSON_IsString(v) && v->valuestring) strlcpy(cfg.sta_ssid, v->valuestring, sizeof(cfg.sta_ssid));
@@ -421,7 +451,15 @@ static esp_err_t api_config_put(httpd_req_t *req)
         || strcmp(before.sta_pass, cfg.sta_pass) != 0
         || strcmp(before.ap_ssid,  cfg.ap_ssid)  != 0
         || strcmp(before.ap_pass,  cfg.ap_pass)  != 0;
-    if (wifi_changed) wifi_mgr_restart();
+    if (wifi_changed) {
+        /* Restart the radio AFTER the response has been flushed. Doing it
+         * synchronously kills the AP/STA netif (and therefore the TCP
+         * socket carrying this request) before httpd gets a chance to
+         * send the reply — the browser would see a network error even
+         * though the save succeeded. The worker waits a moment, then
+         * fires the disruption callback + restart cycle. */
+        xTaskCreate(delayed_wifi_restart_task, "wifi_restart", 4096, NULL, 3, NULL);
+    }
 
     return api_config_get(req);
 }
@@ -471,6 +509,24 @@ static esp_err_t api_heater_power(httpd_req_t *req)
     if (cJSON_IsBool(on)) heater_set_master_enabled(cJSON_IsTrue(on));
     else heater_toggle_master();
     if (body) cJSON_Delete(body);
+    return send_json(req, state_json(), 200);
+}
+
+static esp_err_t api_heater_element(httpd_req_t *req)
+{
+    if (!require_dashboard(req)) return ESP_OK;
+    cJSON *body = read_json_body(req);
+    if (!body) return send_error(req, 400, "invalid body");
+    const cJSON *ch = cJSON_GetObjectItemCaseSensitive(body, "channel");
+    const cJSON *on = cJSON_GetObjectItemCaseSensitive(body, "on");
+    int ci = cJSON_IsNumber(ch) ? ch->valueint : -1;
+    if (ci < 0 || ci >= 2) {
+        cJSON_Delete(body);
+        return send_error(req, 400, "channel must be 0 or 1");
+    }
+    if (cJSON_IsBool(on)) heater_set_element_enabled((uint8_t)ci, cJSON_IsTrue(on));
+    else                  heater_toggle_element((uint8_t)ci);
+    cJSON_Delete(body);
     return send_json(req, state_json(), 200);
 }
 
@@ -658,23 +714,6 @@ static esp_err_t api_boot_switch(httpd_req_t *req)
 
 /* ---------- event log ---------- */
 
-static const char *event_type_name(uint8_t t)
-{
-    static const char *names[] = {
-        "boot", "shutdown", "reboot_request", "factory_reset",
-        "wifi_ap", "wifi_sta_connected", "wifi_sta_disconnected",
-        "time_synced",
-        "button_press", "button_long",
-        "mode_change", "target_change",
-        "master_on", "master_off",
-        "heater_on", "heater_off",
-        "safety_fault", "safety_cleared",
-        "ota_start", "ota_done", "ota_fail",
-        "bench_start", "bench_end", "bench_abort",
-    };
-    return (t < sizeof(names) / sizeof(names[0])) ? names[t] : "unknown";
-}
-
 static esp_err_t api_log(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
@@ -695,6 +734,24 @@ static esp_err_t api_log(httpd_req_t *req)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddNumberToObject(o, "current_boot", event_log_current_boot());
     cJSON_AddItemToObject(o, "events", a);
+    return send_json(req, o, 200);
+}
+
+static esp_err_t api_log_clear(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    event_log_clear();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    return send_json(req, o, 200);
+}
+
+static esp_err_t api_benchmarks_clear(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    event_log_purge_benchmarks();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
     return send_json(req, o, 200);
 }
 
@@ -749,6 +806,7 @@ static esp_err_t api_matter_open(httpd_req_t *req)
  * the token (e.g. handshake reused on a new tab). Caller must NOT hold s_ws_lock. */
 static void ws_table_add(int fd, const char *token)
 {
+    int evicted = -1;
     xSemaphoreTake(s_ws_lock, portMAX_DELAY);
     int slot = -1;
     for (int i = 0; i < MAX_WS_CLIENTS; ++i) {
@@ -761,13 +819,19 @@ static void ws_table_add(int fd, const char *token)
     }
     if (slot < 0) {
         /* Table full: evict slot 0 (oldest by insertion order is good enough
-         * given MAX_WS_CLIENTS=4). The evicted fd's TCP cleanup happens via
-         * httpd's own session timeout. */
+         * given MAX_WS_CLIENTS=4). Capture its fd so we can actively close the
+         * orphaned session below — leaving it for httpd's own timeout wastes a
+         * scarce socket slot and risks the dead-socket spin. */
         slot = 0;
+        evicted = s_ws[0].fd;
     }
     s_ws[slot].fd = fd;
     strlcpy(s_ws[slot].token, token, sizeof(s_ws[slot].token));
     xSemaphoreGive(s_ws_lock);
+
+    if (evicted >= 0 && evicted != fd) {
+        httpd_sess_trigger_close(s_httpd, evicted);
+    }
 }
 
 static void ws_table_drop(int fd)
@@ -827,49 +891,50 @@ static esp_err_t ws_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Inbound frame. We don't accept client→server messages, but the WS spec
-     * requires us to drain frames properly (especially close + control). Peek
-     * the length first so an oversize frame doesn't get truncated into our
-     * stack buffer; if it's too big, discard cleanly and close the slot. */
+    /* Inbound frame on an established socket.
+     *
+     * This dashboard's client is receive-only: it never sends application
+     * data, and the framework already answers PING/CLOSE control frames
+     * before we're invoked. So reaching here almost always means the
+     * connection has gone bad — a peer that slept or dropped off Wi-Fi
+     * feeding garbage / hitting ENOTCONN, or a non-compliant unmasked frame
+     * (RFC6455 forbids unmasked client frames).
+     *
+     * The cardinal rule: on ANY error we must return ESP_FAIL, never ESP_OK.
+     * ESP_FAIL makes httpd_sess_process delete the session and close() the
+     * fd. ESP_OK leaves the broken socket in the poll set, so select() keeps
+     * re-flagging it and the handler re-fires forever — that is the log storm
+     * ("WS frame is not properly masked" / "error in recv : 128"). A genuinely
+     * healthy peer that sends a small well-formed frame is still drained and
+     * kept alive. */
+    int fd = httpd_req_to_sockfd(req);
+
     httpd_ws_frame_t frame = { 0 };
-    esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
-    if (err != ESP_OK) {
-        ws_table_drop(httpd_req_to_sockfd(req));
-        return ESP_OK;
+    if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) {
+        ws_table_drop(fd);
+        return ESP_FAIL;        /* unmasked / malformed header, or dead socket */
     }
     if (frame.type == HTTPD_WS_TYPE_CLOSE) {
-        ws_table_drop(httpd_req_to_sockfd(req));
-        return ESP_OK;
+        ws_table_drop(fd);
+        return ESP_FAIL;        /* client closing — let httpd reap the session */
     }
-    if (frame.len == 0) return ESP_OK;
+    if (frame.len == 0) {
+        return ESP_OK;          /* empty data frame: nothing to drain */
+    }
 
-    /* Bounded payload sink. We discard the contents — but we MUST consume
-     * exactly `frame.len` bytes or the next frame's parse will desync. */
+    /* Drain a small, well-formed payload to keep the byte stream aligned.
+     * Anything larger than this stack sink is not something this client ever
+     * legitimately sends, so close instead of heap-allocating for garbage. */
     uint8_t stack_buf[128];
-    uint8_t *buf = stack_buf;
-    bool heap = false;
     if (frame.len > sizeof(stack_buf)) {
-        if (frame.len > 4096) {
-            /* Cannot consume `frame.len` bytes safely — close the session so
-             * the undrained payload doesn't desync the next frame parse. */
-            int fd = httpd_req_to_sockfd(req);
-            ws_table_drop(fd);
-            httpd_sess_trigger_close(s_httpd, fd);
-            return ESP_OK;
-        }
-        buf = malloc(frame.len);
-        if (!buf) {
-            /* Same desync risk if we can't allocate to drain — close cleanly. */
-            int fd = httpd_req_to_sockfd(req);
-            ws_table_drop(fd);
-            httpd_sess_trigger_close(s_httpd, fd);
-            return ESP_OK;
-        }
-        heap = true;
+        ws_table_drop(fd);
+        return ESP_FAIL;
     }
-    frame.payload = buf;
-    httpd_ws_recv_frame(req, &frame, frame.len);
-    if (heap) free(buf);
+    frame.payload = stack_buf;
+    if (httpd_ws_recv_frame(req, &frame, sizeof(stack_buf)) != ESP_OK) {
+        ws_table_drop(fd);
+        return ESP_FAIL;        /* payload read failed mid-stream */
+    }
     return ESP_OK;
 }
 
@@ -909,9 +974,11 @@ static void ws_pusher_task(void *arg)
              * drops its slot when locked. */
             if (locked_now && !auth_validate_token(tokens[i])) {
                 ws_table_drop(fds[i]);
-                /* Best-effort close frame so the client knows. */
+                /* Best-effort close frame so the client knows, then tear the
+                 * session down so the fd can't linger half-closed. */
                 httpd_ws_frame_t close = { .type = HTTPD_WS_TYPE_CLOSE };
                 httpd_ws_send_frame_async(s_httpd, fds[i], &close);
+                httpd_sess_trigger_close(s_httpd, fds[i]);
                 continue;
             }
             httpd_ws_frame_t frame = {
@@ -919,8 +986,13 @@ static void ws_pusher_task(void *arg)
                 .payload = (uint8_t *)payload,
                 .len     = strlen(payload),
             };
+            /* A failed push means the peer is gone. Drop our slot AND close the
+             * httpd session: otherwise the dead fd sits in the server's table
+             * (eating one of the few socket slots) until TCP finally times out
+             * — and if select() ever flags it, the inbound path above spins. */
             if (httpd_ws_send_frame_async(s_httpd, fds[i], &frame) != ESP_OK) {
                 ws_table_drop(fds[i]);
+                httpd_sess_trigger_close(s_httpd, fds[i]);
             }
         }
         free(payload);
@@ -930,15 +1002,21 @@ static void ws_pusher_task(void *arg)
 
 /* ---------- route registration ---------- */
 
+/* Fail loudly if a route can't be registered (typically because
+ * max_uri_handlers is too low). Silent failure here used to drop the
+ * static-asset wildcard and break the whole UI with "Nothing matches the
+ * given URI". */
 #define ROUTE(uri_, method_, handler_) do { \
     httpd_uri_t _u = { .uri = (uri_), .method = (method_), .handler = (handler_) }; \
-    httpd_register_uri_handler(s_httpd, &_u); \
+    esp_err_t _r = httpd_register_uri_handler(s_httpd, &_u); \
+    if (_r != ESP_OK) ESP_LOGE(TAG, "register %s: %s", (uri_), esp_err_to_name(_r)); \
 } while (0)
 
 #define WS_ROUTE(uri_, handler_) do { \
     httpd_uri_t _u = { .uri = (uri_), .method = HTTP_GET, .handler = (handler_), \
                        .is_websocket = true }; \
-    httpd_register_uri_handler(s_httpd, &_u); \
+    esp_err_t _r = httpd_register_uri_handler(s_httpd, &_u); \
+    if (_r != ESP_OK) ESP_LOGE(TAG, "register %s: %s", (uri_), esp_err_to_name(_r)); \
 } while (0)
 
 esp_err_t web_server_start(void)
@@ -950,13 +1028,36 @@ esp_err_t web_server_start(void)
     if (!s_ws_lock) return ESP_ERR_NO_MEM;
     for (int i = 0; i < MAX_WS_CLIENTS; ++i) s_ws[i].fd = -1;
 
-    /* Mount the web FS (non-fatal if it fails). */
-    web_fs_init();
+    /* Index the firmware-embedded web bundle for serving. */
+    web_assets_init();
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn   = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 24;
+    /* Bumped from 24 → 32: the route list grew (per-element heater
+     * endpoint, fallback config) and the wildcard static fallback was
+     * silently failing to register, leaving every non-API GET to httpd's
+     * default 404. The ROUTE() macro now ESP_LOGE's on failure so the
+     * next overrun will be obvious in the serial log. */
+    cfg.max_uri_handlers = 32;
     cfg.stack_size     = 8192;
+    /* The server is single-task: every REST request, static asset, and the
+     * WS pusher's frames are serviced by one worker over a 7-socket pool
+     * (CONFIG_LWIP_MAX_SOCKETS=10, httpd reserves 3). Two defaults caused the
+     * dashboard to flicker "offline" and drop button POSTs:
+     *   - lru_purge_enable=false → once the pool is full (a browser keeps the
+     *     /ws socket plus several keep-alive HTTP conns), the NEXT connection
+     *     (a state poll, a button POST, a WS reconnect) is REFUSED rather than
+     *     evicting an idle socket. Enabling LRU purge recycles instead.
+     *   - send_wait_timeout=5 → a WS peer with a full TCP window (weak RSSI, a
+     *     slept phone) blocks the single worker mid-send for up to 5 s, during
+     *     which no other client is served. Bound it tighter so one stuck peer
+     *     can't freeze everyone; the pusher already drops the slot on failure. */
+    cfg.lru_purge_enable  = true;
+    cfg.send_wait_timeout = 2;
+    cfg.recv_wait_timeout = 2;
+    /* Use the headroom from CONFIG_LWIP_MAX_SOCKETS=16 (httpd reserves 3).
+     * 12 leaves real cushion for two tabs + reconnects. */
+    cfg.max_open_sockets  = 12;
 
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
@@ -979,9 +1080,10 @@ esp_err_t web_server_start(void)
     ROUTE("/api/config",        HTTP_GET,  api_config_get);
     ROUTE("/api/config",        HTTP_PUT,  api_config_put);
 
-    ROUTE("/api/heater/target", HTTP_POST, api_heater_target);
-    ROUTE("/api/heater/power",  HTTP_POST, api_heater_power);
-    ROUTE("/api/heater/mode",   HTTP_POST, api_heater_mode);
+    ROUTE("/api/heater/target",  HTTP_POST, api_heater_target);
+    ROUTE("/api/heater/power",   HTTP_POST, api_heater_power);
+    ROUTE("/api/heater/mode",    HTTP_POST, api_heater_mode);
+    ROUTE("/api/heater/element", HTTP_POST, api_heater_element);
     ROUTE("/api/safety/clear",  HTTP_POST, api_safety_clear);
 
     ROUTE("/api/wifi/scan",     HTTP_GET,  api_wifi_scan);
@@ -993,6 +1095,8 @@ esp_err_t web_server_start(void)
     ROUTE("/api/maintenance/boot_switch",   HTTP_POST, api_boot_switch);
 
     ROUTE("/api/log", HTTP_GET, api_log);
+    ROUTE("/api/log/clear",        HTTP_POST, api_log_clear);
+    ROUTE("/api/benchmarks/clear", HTTP_POST, api_benchmarks_clear);
 
     ROUTE("/api/matter/code", HTTP_GET,  api_matter_code);
     ROUTE("/api/matter/open", HTTP_POST, api_matter_open);

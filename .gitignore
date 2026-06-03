@@ -8,6 +8,8 @@ managed_components/
 web/node_modules/
 web/dist/
 web/.vite/
+# per-build version counter — local & untracked
+web/.build_version
 
 # IDE
 .vscode/

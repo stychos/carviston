@@ -6,11 +6,18 @@ import TabList from 'primevue/tablist';
 import Tab from 'primevue/tab';
 import TabPanels from 'primevue/tabpanels';
 import TabPanel from 'primevue/tabpanel';
-import BoilerTab from './tabs/BoilerTab.vue';
-import AppTab from './tabs/AppTab.vue';
-import MaintenanceTab from './tabs/MaintenanceTab.vue';
-import LogsTab from './tabs/LogsTab.vue';
 import { api } from '../composables/api.js';
+
+/* Tabs are imported EAGERLY. The whole UI is embedded in the firmware and
+ * served from flash over the LAN, so code-splitting buys no network win — it
+ * only adds an on-demand chunk fetch that can land late or unstyled in a
+ * constrained context (e.g. a captive first-boot AP). Folding the tabs into
+ * the entry bundle keeps the dialog instant and removes that failure mode. */
+import BoilerTab      from './tabs/BoilerTab.vue';
+import AppTab         from './tabs/AppTab.vue';
+import WifiTab        from './tabs/WifiTab.vue';
+import MaintenanceTab from './tabs/MaintenanceTab.vue';
+import LogsTab        from './tabs/LogsTab.vue';
 
 const props = defineProps({ visible: Boolean });
 const emit  = defineEmits(['update:visible']);
@@ -19,7 +26,7 @@ watch(() => props.visible, v => visible.value = v);
 watch(visible, v => emit('update:visible', v));
 
 const cfg = ref(null);
-const activeTab = ref('0');
+const activeTab = ref('heater');
 
 async function load() {
   try { cfg.value = await api.get('/api/config'); }
@@ -39,10 +46,11 @@ async function save(patch) {
     <template v-if="cfg">
       <Tabs v-model:value="activeTab">
         <TabList>
-          <Tab value="0">Boiler</Tab>
-          <Tab value="1">Wi-Fi</Tab>
-          <Tab value="2">Logs</Tab>
-          <Tab value="3">Maintenance</Tab>
+          <Tab value="heater">Heater</Tab>
+          <Tab value="app">App</Tab>
+          <Tab value="wifi">Wi-Fi</Tab>
+          <Tab value="logs">Logs</Tab>
+          <Tab value="maintenance">Maintenance</Tab>
         </TabList>
         <TabPanels>
           <!-- Pass `save` as an async callback prop, not as an event listener:
@@ -50,10 +58,11 @@ async function save(patch) {
                doing `await emit('save', …)` cannot observe a rejection from
                the parent's async handler. A function prop preserves the
                Promise so try/catch in the child actually catches failures. -->
-          <TabPanel value="0"><BoilerTab :cfg="cfg" :on-save="save" /></TabPanel>
-          <TabPanel value="1"><AppTab    :cfg="cfg" :on-save="save" /></TabPanel>
-          <TabPanel value="2"><LogsTab /></TabPanel>
-          <TabPanel value="3"><MaintenanceTab /></TabPanel>
+          <TabPanel value="heater"><BoilerTab :cfg="cfg" :on-save="save" /></TabPanel>
+          <TabPanel value="app"><AppTab :cfg="cfg" :on-save="save" /></TabPanel>
+          <TabPanel value="wifi"><WifiTab :cfg="cfg" :on-save="save" /></TabPanel>
+          <TabPanel value="logs"><LogsTab /></TabPanel>
+          <TabPanel value="maintenance"><MaintenanceTab /></TabPanel>
         </TabPanels>
       </Tabs>
     </template>

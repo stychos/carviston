@@ -1,4 +1,31 @@
+/* LIGHT is the default palette; DARK overrides under :root.dark-mode (the class
+ * is toggled on <html> by composables/theme.js). Every surface/text colour is a
+ * variable, so the whole UI — and the PrimeVue overrides further down, which
+ * also key off these variables — flips with a single class. "heat" is distinct
+ * from "warn": warn = needs attention, heat = elements actively firing. */
 :root {
+  color-scheme: light;
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --border: #d0d7de;
+  --text: #1f2328;
+  --muted: #59636e;
+  --accent: #0969da;
+  --good: #1a7f37;
+  --warn: #9a6700;
+  --bad: #cf222e;
+  --heat: #d4541f;
+  --heat-soft: rgba(212, 84, 31, 0.16);
+  --bg-gradient: linear-gradient(160deg, #f6f8fa 0%, #e7ebf0 100%);
+  --row-alt: rgba(0, 0, 0, 0.03);
+  --row-hover: rgba(0, 0, 0, 0.06);
+  --tile-top: rgba(0, 0, 0, 0.015);
+  --shadow-strong: 0 16px 40px rgba(140, 149, 159, 0.25);
+  --mask: rgba(20, 24, 31, 0.45);
+}
+
+:root.dark-mode {
   color-scheme: dark;
   --bg: #0d1117;
   --surface: #161b22;
@@ -10,21 +37,42 @@
   --good: #3fb950;
   --warn: #d29922;
   --bad: #f85149;
+  --heat: #ff7849;
+  --heat-soft: rgba(255, 120, 73, 0.22);
+  --bg-gradient: linear-gradient(160deg, #1a1f2e 0%, #0d1117 100%);
+  --row-alt: rgba(255, 255, 255, 0.02);
+  --row-hover: rgba(255, 255, 255, 0.05);
+  --tile-top: rgba(255, 255, 255, 0.04);
+  --shadow-strong: 0 16px 48px rgba(0, 0, 0, 0.5);
+  --mask: rgba(0, 0, 0, 0.55);
 }
 
 * { box-sizing: border-box; }
 
 html, body, #app {
   margin: 0; padding: 0; min-height: 100vh; height: 100%;
-  background: linear-gradient(160deg, #1a1f2e 0%, #0d1117 100%);
+  background: var(--bg-gradient);
   color: var(--text);
   font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
+/* Keep the centred column from jumping between states. A *classic* vertical
+ * scrollbar (macOS "Show scroll bars: Always", or simply a taller page in one
+ * state than another) steals width from the viewport, so a margin:auto layout
+ * re-centres in the narrower space and visibly shifts when the bar appears or
+ * disappears. `scrollbar-gutter: stable` reserves that width up-front so the
+ * usable width — and the centring — stay constant whether or not the bar shows.
+ * `overflow-x: clip` additionally stops any stray wide overlay from adding a
+ * horizontal scrollbar (pins width to the viewport, no scroll container). */
+html { scrollbar-gutter: stable; }
+html, body { overflow-x: clip; }
 body { overscroll-behavior: none; }
 
+/* Setup / Login wrapper. flex:1 lets it fill the space above the app footer
+ * (the app-root flex column provides the full height) while still centring. */
 .center {
-  min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  flex: 1 0 auto;
+  display: grid; place-items: center; padding: 24px;
 }
 
 .card {
@@ -33,7 +81,7 @@ body { overscroll-behavior: none; }
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 28px;
-  box-shadow: 0 16px 48px rgba(0,0,0,.5);
+  box-shadow: var(--shadow-strong);
 }
 
 .shell {
@@ -46,7 +94,16 @@ body { overscroll-behavior: none; }
 }
 
 .app-title {
-  font-size: 20px; font-weight: 600; letter-spacing: 0.3px;
+  display: flex; align-items: center; gap: 9px;
+  font-size: 20px; font-weight: 600; letter-spacing: 0.4px;
+}
+/* Small heat-coloured mark — gives the wordmark a point of view without a
+ * webfont. Glows faintly so it reads as a pilot light. */
+.brand-mark {
+  width: 10px; height: 10px; border-radius: 3px;
+  background: linear-gradient(140deg, var(--heat) 0%, #ffb347 100%);
+  box-shadow: 0 0 12px var(--heat-soft);
+  flex: none;
 }
 
 .muted { color: var(--muted); }
@@ -59,6 +116,10 @@ body { overscroll-behavior: none; }
 .tile {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 12px; padding: 16px;
+  /* Hairline top highlight + a soft long shadow lift the flat surfaces off
+   * the background so the dark palette reads as layered, not uniform. */
+  box-shadow: inset 0 1px 0 var(--tile-top),
+              0 12px 32px -24px rgba(0, 0, 0, 0.45);
 }
 
 .tile h3 {
@@ -66,14 +127,11 @@ body { overscroll-behavior: none; }
   letter-spacing: 0.5px; color: var(--muted); font-weight: 500;
 }
 
-.big-num {
-  font: 600 36px/1 ui-monospace, "SF Mono", Menlo, monospace;
-}
-
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 999px;
   background: var(--surface-2); font-size: 12px; color: var(--muted);
+  font-variant-numeric: tabular-nums;   /* probe readouts don't jitter as digits change */
 }
 .pill .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
@@ -81,6 +139,81 @@ body { overscroll-behavior: none; }
 .pill.good .dot { background: var(--good); }
 .pill.warn .dot { background: var(--warn); }
 .pill.bad  .dot { background: var(--bad); }
+
+/* Pill rendered as a button — visually identical to a <span class="pill">
+ * (same padding, same font-size, same colors) but clickable. */
+.pill.pill-button {
+  border: 0; margin: 0;
+  padding: 4px 10px; font: 12px/1 inherit;
+  cursor: pointer;
+  transition: background .12s, transform .04s;
+}
+.pill.pill-button:hover { background: var(--border); }
+.pill.pill-button:active { transform: translateY(1px); }
+
+/* Dashboard power toggle — reflects master_enabled (the physical POWER button).
+ * Green when on, muted when off; disabled while offline / before first state. */
+.power-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--muted); font: 600 13px/1 system-ui, sans-serif;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s, transform .04s;
+}
+.power-toggle .pi { font-size: 14px; }
+.power-toggle:hover { background: var(--border); }
+.power-toggle:active { transform: translateY(1px); }
+.power-toggle.on {
+  background: rgba(63, 185, 80, 0.15); border-color: var(--good); color: var(--good);
+}
+.power-toggle:disabled { opacity: .4; cursor: not-allowed; }
+.power-toggle:disabled:hover { background: var(--surface-2); }
+
+/* Hero tile: gauge on the left, status column on the right. Collapses to a
+ * single centred column on narrow viewports (see the media query below). */
+.hero {
+  display: flex; align-items: center; gap: 22px;
+}
+.hero-info {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+}
+/* Breathing room between the On/Shower row and the per-tank readouts. */
+.hero-tanks {
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 18px;
+}
+.tank-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; line-height: 1;
+}
+.tank-row .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--muted); flex: none;
+}
+.tank-row .dot.good { background: var(--good); }
+.tank-row .dot.bad  { background: var(--bad); }
+.tank-name {
+  color: var(--muted); min-width: 50px;
+}
+.tank-temps {
+  color: var(--text); font-size: 12.5px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.tank-state {
+  margin-left: auto; padding-left: 10px;
+  font-size: 11px; font-weight: 600; letter-spacing: .3px;
+  text-transform: uppercase;
+}
+.tank-state.state-heating { color: var(--heat); }
+.tank-state.state-standby { color: var(--muted); }
+.tank-state.state-off     { color: var(--muted); opacity: .55; }
+@media (max-width: 560px) {
+  .hero { flex-direction: column; align-items: stretch; gap: 16px; }
+  .hero-tanks { margin-top: 14px; }
+}
 
 .temp-row {
   display: grid; gap: 6px; grid-template-columns: repeat(5, 1fr);
@@ -97,6 +230,14 @@ body { overscroll-behavior: none; }
   background: linear-gradient(135deg, #2f81f7 0%, #1f6feb 100%);
   border-color: #58a6ff; color: #fff;
   box-shadow: 0 0 0 1px #58a6ff inset, 0 4px 16px rgba(47, 129, 247, .25);
+}
+/* Disabled when the heater is off: locked, no hover/active affordance. The
+ * currently-selected step still shows (dimmed) so the set value stays visible. */
+.temp-step:disabled, .mode-step:disabled { opacity: .45; cursor: not-allowed; }
+.temp-step:disabled:hover, .mode-step:disabled:hover { background: var(--surface-2); }
+.temp-step:disabled:active, .mode-step:disabled:active { transform: none; }
+.temp-step.active:disabled, .mode-step.active:disabled {
+  background: linear-gradient(135deg, #2f81f7 0%, #1f6feb 100%);
 }
 
 .mode-row {
@@ -120,15 +261,60 @@ body { overscroll-behavior: none; }
   box-shadow: 0 0 0 1px #58a6ff inset, 0 4px 16px rgba(47, 129, 247, .25);
 }
 
-.h-status {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+/* System tile — Wi-Fi + safety rows */
+.sys-row {
+  display: flex; align-items: center; gap: 14px;
 }
-.h-status .h {
-  padding: 10px 14px; border-radius: 10px; background: var(--surface-2);
-  display: flex; justify-content: space-between; align-items: center;
+.sys-icon-cell {
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  border-radius: 10px;
+  background: var(--surface-2);
 }
-.h.on  { background: linear-gradient(135deg, #ff7847 0%, #d63f1f 100%); color: #fff; }
-.h.off { color: var(--muted); }
+.sys-icon-cell.sys-good    { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+.sys-icon-cell.sys-warn    { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+.sys-icon-cell.sys-bad     { background: rgba(248, 81, 73, 0.18); color: var(--bad);  }
+.sys-icon-cell.sys-ok      { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+.sys-icon-cell.sys-loading { color: var(--muted); }
+.sys-pi-large { font-size: 22px; }
+
+.sys-text { flex: 1; min-width: 0; }
+.sys-title {
+  font-size: 16px; font-weight: 600; line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sys-subtitle {
+  font-size: 12px; margin-top: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Network + Safety sit in two equal tiles, mirroring the Maintenance tab's
+ * paired-card layout. Equal-height columns; collapses to a single column on
+ * narrow screens. */
+.tile-row {
+  display: grid; gap: 16px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 520px) {
+  .tile-row { grid-template-columns: 1fr; }
+}
+
+.signal-bars {
+  display: inline-flex; align-items: flex-end; gap: 2px;
+  height: 24px;
+}
+.signal-bars .bar {
+  width: 4px; background: var(--border); border-radius: 1px;
+  transition: background .15s;
+}
+.signal-bars .bar:nth-child(1) { height: 30%; }
+.signal-bars .bar:nth-child(2) { height: 53%; }
+.signal-bars .bar:nth-child(3) { height: 76%; }
+.signal-bars .bar:nth-child(4) { height: 100%; }
+.signal-bars .bar.on { background: var(--good); }
+.sys-icon-cell.sys-warn .signal-bars .bar.on { background: var(--warn); }
+.sys-icon-cell.sys-bad  .signal-bars .bar.on { background: var(--bad);  }
 
 .matter-manual {
   font: 600 22px/1.2 ui-monospace, "SF Mono", Menlo, monospace;
@@ -198,7 +384,7 @@ body { overscroll-behavior: none; }
   --p-overlay-modal-background: var(--surface);
   --p-overlay-modal-border-color: var(--border);
   --p-overlay-modal-color: var(--text);
-  --p-mask-background: rgba(0, 0, 0, 0.55);
+  --p-mask-background: var(--mask);
   --p-content-background: var(--surface);
   --p-content-border-color: var(--border);
   --p-content-color: var(--text);
@@ -214,9 +400,9 @@ body { overscroll-behavior: none; }
 }
 .p-dialog {
   border: 1px solid var(--border) !important;
-  box-shadow: 0 20px 60px rgba(0,0,0,.55) !important;
+  box-shadow: var(--shadow-strong) !important;
 }
-.p-dialog-mask { background: rgba(0, 0, 0, 0.55) !important; }
+.p-dialog-mask { background: var(--mask) !important; }
 
 /* Tabs — both the tablist strip and every tab button + the active indicator. */
 .p-tabs,
@@ -284,4 +470,160 @@ body { overscroll-behavior: none; }
 .p-select-option.p-select-option-selected,
 .p-select-option:hover {
   background: var(--surface-2) !important;
+}
+
+/* DataTable (Logs → "Heating performance") renders inside the config Dialog,
+ * which PrimeVue teleports to <body> — outside .dark-mode — so Aura paints it
+ * in light mode (white header + rows). Flatten it onto the dark palette like
+ * the dialog/inputs above. */
+.p-datatable,
+.p-datatable-table-container,
+.p-datatable-table,
+.p-datatable-tbody > tr,
+.p-datatable-tbody > tr > td {
+  background: transparent !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+.p-datatable-thead > tr > th {
+  background: var(--surface-2) !important;
+  color: var(--muted) !important;
+  border-color: var(--border) !important;
+}
+/* Zebra + hover painted on the cells, since the row bg is forced transparent. */
+.p-datatable-tbody > tr:nth-child(even) > td { background: var(--row-alt) !important; }
+.p-datatable-tbody > tr:hover > td          { background: var(--row-hover) !important; }
+
+/* --- Temperature gauge (Dashboard hero) -----------------------------------
+ * A 270° radial arc that fills to the current water temperature, with a tick
+ * marking the target. The arc is blue at rest and shifts to "heat" orange with
+ * a breathing glow whenever an element is actually firing — the panel reads as
+ * warming at a glance, before you parse any number. */
+.hero-head {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+}
+
+.gauge {
+  position: relative;
+  width: 168px; flex: none;
+  aspect-ratio: 1; margin: 0;
+}
+/* On a phone the hero stacks; let the dial breathe and stay centred. */
+@media (max-width: 560px) {
+  .gauge { width: min(190px, 64%); margin: 2px auto 0; }
+}
+/* Breathing warmth behind the dial — only present while heating. */
+.gauge::before {
+  content: ""; position: absolute; inset: -10%;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--heat-soft) 0%, transparent 62%);
+  opacity: 0; transition: opacity .5s ease; pointer-events: none;
+}
+.gauge.heating::before {
+  opacity: 1; animation: heatPulse 2.6s ease-in-out infinite;
+}
+.gauge-svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.gauge-track, .gauge-value {
+  fill: none; stroke-width: 12; stroke-linecap: round;
+}
+.gauge-track { stroke: var(--surface-2); }
+.gauge-value {
+  stroke: var(--accent);
+  transition: stroke-dasharray .6s cubic-bezier(.4, 0, .2, 1), stroke .45s ease;
+  filter: drop-shadow(0 0 6px rgba(47, 129, 247, 0.35));
+}
+.gauge.heating .gauge-value { stroke: var(--heat); filter: drop-shadow(0 0 8px var(--heat-soft)); }
+.gauge.fault   .gauge-value { stroke: var(--bad); filter: none; }
+.gauge-target { fill: var(--text); stroke: var(--bg); stroke-width: 2; }
+
+.gauge-center {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 3px;
+}
+.gauge-temp {
+  font: 700 38px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums; letter-spacing: -1.5px;
+  color: var(--text); transition: color .45s ease;
+}
+.gauge.heating .gauge-temp { color: var(--heat); }
+.gauge.fault  .gauge-temp { color: var(--bad); }
+.gauge-unit { font-size: 15px; font-weight: 600; color: var(--muted); margin-left: 3px; }
+.gauge-sub {
+  font-size: 11px; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--muted); font-variant-numeric: tabular-nums;
+}
+
+@keyframes heatPulse {
+  0%, 100% { opacity: .4;  transform: scale(.97); }
+  50%      { opacity: .85; transform: scale(1.03); }
+}
+
+/* --- Page-load reveal ------------------------------------------------------
+ * Scoped to the dashboard shell so dialogs (which also use .stack) are
+ * untouched. Tiles rise and fade in, lightly staggered. */
+.shell > .stack > * {
+  animation: tileRise .5s cubic-bezier(.2, .7, .2, 1) both;
+}
+.shell > .stack > *:nth-child(1) { animation-delay: .03s; }
+.shell > .stack > *:nth-child(2) { animation-delay: .09s; }
+.shell > .stack > *:nth-child(3) { animation-delay: .15s; }
+.shell > .stack > *:nth-child(4) { animation-delay: .21s; }
+.shell > .stack > *:nth-child(5) { animation-delay: .27s; }
+@keyframes tileRise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gauge.heating::before { animation: none; }
+  .gauge-value { transition: none; }
+  .shell > .stack > * { animation: none; }
+}
+
+/* --- App shell + footer ---------------------------------------------------
+ * Column layout so the footer (with the theme switcher) sits at the bottom of
+ * the viewport on short pages and after the content on long ones. The active
+ * view (.shell dashboard or .center setup/login) fills the space above it. */
+.app-root { display: flex; flex-direction: column; min-height: 100vh; }
+.app-root > .shell { flex: 1 0 auto; }
+
+.app-footer {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 40%, transparent);
+}
+.app-footer-inner {
+  max-width: 720px; margin: 0 auto; width: 100%;
+  padding: 14px 16px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-size: 12px; color: var(--muted); letter-spacing: .3px;
+}
+
+/* Segmented Auto / Light / Dark control. */
+.theme-switch {
+  display: inline-flex; gap: 2px;
+  padding: 2px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.theme-switch button {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 0; background: transparent; color: var(--muted);
+  font: 600 12px/1 system-ui, sans-serif;
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.theme-switch button .pi { font-size: 12px; }
+.theme-switch button:hover { color: var(--text); }
+.theme-switch button.active {
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .18);
+}
+.theme-switch button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+/* On narrow screens drop the text labels, keep the icons. */
+@media (max-width: 420px) {
+  .theme-switch-label { display: none; }
+  .theme-switch button { padding: 7px 11px; }
 }

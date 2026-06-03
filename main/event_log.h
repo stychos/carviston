@@ -70,12 +70,28 @@ void event_log_flush(void);
 uint32_t event_log_current_boot(void);
 
 /* Append an event. ia/ib are type-specific (may be 0). text is optional
- * (NULL → empty). Any extra characters are truncated. */
+ * (NULL → empty). Any extra characters are truncated. Every call also
+ * prints the event to the serial console at INFO level so `idf.py monitor`
+ * shows a live trace alongside the in-memory ring. */
 void event_log_emit(event_type_t type, int16_t ia, int16_t ib, const char *text);
+
+/* Human-readable snake_case name for an event type — "target_change",
+ * "wifi_sta_connected", etc. Returns "unknown" for out-of-range values.
+ * Used by both the serial-log path and the JSON HTTP endpoint. */
+const char *event_type_name(event_type_t type);
 
 /* Fill `out` (up to `cap` slots) with the newest-first chronological order.
  * Returns count written. */
 int event_log_snapshot(event_record_t *out, int cap);
+
+/* Erase every stored event and persist the empty ring. boot_num is preserved.
+ * Also empties the derived heating-performance view (benchmarks live in the
+ * event log). */
+void event_log_clear(void);
+
+/* Drop only the benchmark records (bench_start/end/abort), keeping the rest of
+ * the event log. Used by the "clear heating performance" action. */
+void event_log_purge_benchmarks(void);
 
 #ifdef __cplusplus
 }

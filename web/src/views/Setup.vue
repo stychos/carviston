@@ -48,7 +48,7 @@ async function submit() {
         <Message v-if="err" severity="error" :closable="false">{{ err }}</Message>
         <Button label="Save and continue" :disabled="!canGo" :loading="busy" @click="submit" />
         <div class="muted" style="font-size: 12px; text-align: center;">
-          Password is stored as a salted PBKDF2-SHA256 hash on the device.
+          Used to protect the settings page. Stored securely on the device.
         </div>
       </div>
     </div>

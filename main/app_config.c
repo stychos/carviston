@@ -17,7 +17,7 @@ static const char *TAG = "app_config";
 #define CFG_NVS_NS        "carviston"
 #define CFG_NVS_BLOB_KEY  "cfg"
 
-#define CFG_VERSION       3
+#define CFG_VERSION       7
 
 /* Coalescing window for deferred saves — after a save is signalled we wait
  * this long for further changes to land before committing. Tunes the
@@ -43,6 +43,7 @@ static void apply_defaults(app_config_t *c)
 {
     memset(c, 0, sizeof(*c));
     c->version              = CFG_VERSION;
+    strlcpy(c->device_name, "Carviston", sizeof(c->device_name));
     c->configured           = false;
     c->pbkdf2_iterations    = 10000;
     c->dashboard_locked     = false;       /* dashboard is open by default; only settings need a password */
@@ -67,10 +68,15 @@ static void apply_defaults(app_config_t *c)
     c->eco_led_mode         = ECO_LED_WIFI_STATE;
     c->dashboard_unit       = TEMP_UNIT_CELSIUS;
     c->wifi_mode            = WIFI_ROLE_AP;
-    c->hybrid_sta_seconds   = 60;
+    c->sta_fallback_enabled = true;
+    c->sta_fallback_seconds = 60;
     c->long_press_ms        = 1500;
     c->preview_release_ms   = 3000;
     c->bench_resume_threshold_s = 600;
+    c->restore_power_on_boot = true;        /* heater returns to its last on/off state after a
+                                               reboot/power cut. A never-configured device still
+                                               boots OFF, since last_power_state defaults to 0
+                                               (memset) until the user turns it on at least once. */
     /* ap_ssid empty → derived from MAC at runtime */
 }
 
@@ -257,6 +263,16 @@ bool app_config_is_configured(void)
     v = s_cfg.configured;
     xSemaphoreGive(s_mutex);
     return v;
+}
+
+void app_config_get_device_name(char *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Fall back to the product name when the user has cleared it. */
+    const char *name = s_cfg.device_name[0] ? s_cfg.device_name : "Carviston";
+    strlcpy(buf, name, len);
+    xSemaphoreGive(s_mutex);
 }
 
 bool app_config_dashboard_locked(void)

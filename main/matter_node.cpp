@@ -55,47 +55,45 @@ static uint16_t    s_probe_ep_id[PROBE_EP_COUNT] = { 0, 0, 0, 0 };
 
 static const struct probe_meta_t {
     const char *label;       /* user-visible name (Fixed Label cluster) */
-    uint8_t     probe_idx;   /* 0 = Probe A, 1 = Probe B */
+    uint8_t     tank_idx;    /* TANK_INLET = 0, TANK_OUTLET = 1 */
     bool        is_safety;   /* false = regulation NTC, true = safety NTC */
 } s_probe_meta[PROBE_EP_COUNT] = {
-    { "Probe A regulation", 0, false },
-    { "Probe A safety",     0, true  },
-    { "Probe B regulation", 1, false },
-    { "Probe B safety",     1, true  },
+    { "Inlet tank regulation",  TANK_INLET,  false },
+    { "Inlet tank safety",      TANK_INLET,  true  },
+    { "Outlet tank regulation", TANK_OUTLET, false },
+    { "Outlet tank safety",     TANK_OUTLET, true  },
 };
 
-/* Pull the (signed) reading for probe i out of a temperature_reading_t,
- * honouring the per-probe fault flag and NaN. Returns false if no valid
- * value should be published (caller must use the null marker). */
+/* Pull the (signed) reading for NTC endpoint i out of a temperature_reading_t,
+ * honouring the per-tank fault flag and NaN. Returns false if no valid value
+ * should be published (caller must use the null marker). */
 static bool probe_value_c(const temperature_reading_t &t, int i, float *out)
 {
-    const probe_reading_t &p = t.probe[s_probe_meta[i].probe_idx];
+    const tank_reading_t &p = t.tank[s_probe_meta[i].tank_idx];
     float c = s_probe_meta[i].is_safety ? p.safety_c : p.regulation_c;
     if (p.fault || isnan(c)) return false;
     *out = c;
     return true;
 }
 
-/* EP 6 — GenericSwitch (latching) exposing safety_status_t (0..4).
+/* EP 6 — GenericSwitch (latching) exposing safety_status_t (0..2).
  *
  *   Position 0  SAFETY_OK
- *   Position 1  SAFETY_FAULT_CUTOFF       (KSD301 tripped, JD-VCC rail open)
- *   Position 2  SAFETY_FAULT_PROBE        (probe disagreement / open / short)
- *   Position 3  SAFETY_FAULT_OVERTEMP     (water > soft 95 °C limit)
- *   Position 4  SAFETY_FAULT_NO_PROBES    (all probes faulted, no reading)
+ *   Position 1  SAFETY_FAULT_OVERTEMP     (a tank > soft 90 °C limit)
+ *   Position 2  SAFETY_FAULT_NO_PROBES    (all tanks faulted, no reading)
  *
- * Each transition fires a SwitchLatched event so controllers can wire
- * "if heater faults → notify me" automations.
+ * A single tank's probe failing is handled per-tank (the healthy tank keeps
+ * running) and surfaces on that tank's TemperatureSensor endpoint going null,
+ * not here. Each transition fires a SwitchLatched event so controllers can
+ * wire "if heater faults → notify me" automations.
  */
 static endpoint_t *s_safety_ep = nullptr;
 static uint16_t    s_safety_ep_id = 0;
 
 static const char *const s_safety_label[] = {
     "OK",
-    "Hardware cutoff (KSD301) tripped",
-    "Probe disagreement / sensor fault",
-    "Over-temperature (soft cutoff)",
-    "All probes faulted",
+    "Over-temperature",
+    "All tanks faulted",
 };
 #define SAFETY_POSITIONS ((uint8_t)(sizeof(s_safety_label) / sizeof(s_safety_label[0])))
 

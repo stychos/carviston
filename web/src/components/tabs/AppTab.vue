@@ -1,11 +1,13 @@
 <script setup>
-import { reactive, ref, watch, onMounted } from 'vue';
+import { reactive, ref, watch } from 'vue';
 import Select from 'primevue/select';
 import InputText from 'primevue/inputtext';
+import Checkbox from 'primevue/checkbox';
 import Password from 'primevue/password';
 import Button from 'primevue/button';
 import { useToast } from 'primevue/usetoast';
-import { api, HttpError } from '../../composables/api.js';
+import { api } from '../../composables/api.js';
+import { refreshStatus } from '../../composables/auth.js';
 
 const props = defineProps({
   cfg: Object,
@@ -13,73 +15,109 @@ const props = defineProps({
 });
 const toast = useToast();
 
-const WIFI_MODES = [
-  { v: 0, l: 'Access Point only' },
-  { v: 1, l: 'Client (STA)' },
-  { v: 2, l: 'Hybrid (AP + STA simultaneously)' },
+const POWER_LED_MODES = [
+  { v: 0, l: 'Always on' },
+  { v: 1, l: 'Only when a heater is active' },
+];
+const ECO_LED_MODES = [
+  { v: 0, l: 'Wi-Fi state' },
+  { v: 1, l: 'Eco mode indicator' },
+];
+const UNITS = [
+  { v: 0, l: 'Celsius' },
+  { v: 1, l: 'Fahrenheit' },
 ];
 
 const form = reactive({
-  wifi_mode: props.cfg.wifi_mode,
-  sta_ssid:  props.cfg.sta_ssid,
-  sta_pass:  '',
-  ap_ssid:   props.cfg.ap_ssid,
-  ap_pass:   '',
+  power_led_mode: props.cfg.power_led_mode,
+  eco_led_mode:   props.cfg.eco_led_mode,
+  dashboard_unit: props.cfg.dashboard_unit,
 });
 watch(() => props.cfg, c => Object.assign(form, {
-  wifi_mode: c.wifi_mode, sta_ssid: c.sta_ssid, ap_ssid: c.ap_ssid,
+  power_led_mode: c.power_led_mode,
+  eco_led_mode:   c.eco_led_mode,
+  dashboard_unit: c.dashboard_unit,
 }));
 
-const networks = ref([]);
-const scanning = ref(false);
-async function scan() {
-  scanning.value = true;
-  try { networks.value = await api.get('/api/wifi/scan'); }
-  catch { networks.value = []; }
-  finally { scanning.value = false; }
-}
-onMounted(scan);
-
-const testing = ref(false);
-async function testCredentials() {
-  if (!form.sta_ssid) {
-    toast.add({ severity: 'warn', summary: 'Pick a network first', life: 2500 });
-    return;
-  }
-  testing.value = true;
+/* --- Device name. Saved on blur / Enter rather than per-keystroke. */
+const deviceName = ref(props.cfg.device_name || '');
+watch(() => props.cfg.device_name, v => { deviceName.value = v || ''; });
+async function saveDeviceName() {
+  const name = deviceName.value.trim();
+  if (name === (props.cfg.device_name || '')) return;   /* nothing changed */
   try {
-    const r = await api.post('/api/wifi/test', {
-      ssid: form.sta_ssid,
-      password: form.sta_pass,
-      timeout_s: 12,
-    });
-    if (r.ok) {
-      toast.add({ severity: 'success', summary: 'Connected — credentials work',
-                  detail: 'Save to make this persistent', life: 4000 });
-    } else {
-      toast.add({ severity: 'error', summary: 'Could not connect',
-                  detail: r.error || 'unknown reason', life: 4000 });
-    }
+    await props.onSave({ device_name: name });
+    toast.add({ severity: 'success', summary: 'Saved', life: 1200 });
   } catch (e) {
-    const detail = (e instanceof HttpError) ? e.message : (e?.message || String(e));
-    toast.add({ severity: 'error', summary: 'Test failed', detail, life: 4000 });
-  } finally {
-    testing.value = false;
+    deviceName.value = props.cfg.device_name || '';
+    toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
   }
 }
 
-async function saveNetwork() {
-  const patch = {
-    wifi_mode: form.wifi_mode,
-    sta_ssid: form.sta_ssid,
-    ap_ssid: form.ap_ssid,
-  };
-  if (form.sta_pass) patch.sta_pass = form.sta_pass;
-  if (form.ap_pass)  patch.ap_pass  = form.ap_pass;
+/* Auto-save on every Select change. The Select's @change fires only on
+ * user interaction (not on the watch above that mirrors external cfg
+ * updates), so we don't risk an echo loop. The backend coalesces rapid
+ * NVS writes via app_config_save_deferred. */
+async function autoSave(patch) {
   try {
     await props.onSave(patch);
-    toast.add({ severity: 'success', summary: 'Saved', life: 2500 });
-    form.sta_pass = ''; form.ap_pass = '';
+    toast.add({ severity: 'success', summary: 'Saved', life: 1200 });
+  } catch (e) {
+    toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
+  }
+}
+
+/* --- Remember on/off across reboots / power cuts. */
+const restorePower = ref(!!props.cfg.restore_power_on_boot);
+watch(() => props.cfg.restore_power_on_boot, v => { restorePower.value = !!v; });
+async function onRestorePowerChange(e) {
+  const v = !!e.checked;
+  try {
+    await props.onSave({ restore_power_on_boot: v });
+    toast.add({ severity: 'success', summary: 'Saved', life: 1200 });
+  } catch (err) {
+    restorePower.value = !v;
+    toast.add({ severity: 'error', summary: 'Failed', detail: err.message, life: 3000 });
+  }
+}
+
+/* --- Dashboard lock — moved from Maintenance into the password block. */
+const dashboardLocked = ref(!!props.cfg.dashboard_locked);
+watch(() => props.cfg.dashboard_locked, v => { dashboardLocked.value = !!v; });
+async function onDashboardLockChange(e) {
+  const v = !!e.checked;
+  try {
+    await props.onSave({ dashboard_locked: v });
+    await refreshStatus();
+    toast.add({
+      severity: 'success',
+      summary: v ? 'Dashboard now requires password' : 'Dashboard is now open',
+      life: 2500,
+    });
+  } catch (err) {
+    dashboardLocked.value = !v;
+    toast.add({ severity: 'error', summary: 'Failed', detail: err.message, life: 3000 });
+  }
+}
+
+/* --- Password change. Backend revokes every session on success, so we
+ * reload the page to land on a fresh auth state — Dashboard if the
+ * dashboard is unlocked, Login screen if it's locked. */
+const oldPw = ref('');
+const newPw = ref('');
+async function changePassword() {
+  if (!newPw.value || newPw.value.length < 4) {
+    toast.add({ severity: 'warn', summary: 'New password too short', life: 2500 });
+    return;
+  }
+  try {
+    await api.post('/api/auth/password', { old: oldPw.value, new: newPw.value });
+    toast.add({ severity: 'success', summary: 'Password updated — signing out…', life: 1500 });
+    oldPw.value = ''; newPw.value = '';
+    /* Brief delay so the toast is visible before the navigation. */
+    setTimeout(() => {
+      window.location.replace('/?v=' + Date.now());
+    }, 1200);
   } catch (e) {
     toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
   }
@@ -88,46 +126,86 @@ async function saveNetwork() {
 
 <template>
   <div class="stack">
-    <label class="muted">Wi-Fi mode</label>
-    <Select v-model="form.wifi_mode" :options="WIFI_MODES" optionLabel="l" optionValue="v" fluid />
-
-    <div v-if="form.wifi_mode !== 0">
-      <div class="spaced">
-        <label class="muted">Available networks</label>
-        <Button label="Rescan" size="small" text :loading="scanning" @click="scan" />
-      </div>
-      <div style="max-height: 140px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; padding: 4px;">
-        <div v-for="n in networks" :key="n.ssid + n.channel"
-             style="padding: 6px 8px; cursor: pointer; border-radius: 6px;"
-             @click="form.sta_ssid = n.ssid"
-             :style="{ background: form.sta_ssid === n.ssid ? 'var(--surface-2)' : '' }">
-          <span>{{ n.ssid }}</span>
-          <span class="muted" style="float: right; font-size: 12px;">{{ n.rssi }} dBm</span>
-        </div>
-        <div v-if="!networks.length" class="muted" style="padding: 8px;">No networks yet.</div>
-      </div>
-      <label class="muted" style="margin-top: 8px; display: block;">STA SSID</label>
-      <InputText v-model="form.sta_ssid" fluid />
-      <label class="muted">STA password</label>
-      <Password v-model="form.sta_pass" toggleMask :feedback="false" placeholder="leave blank to keep current" fluid />
-
-      <Button label="Test connection" icon="pi pi-bolt"
-              severity="secondary" :loading="testing"
-              :disabled="!form.sta_ssid" style="margin-top: 8px;"
-              @click="testCredentials" />
-      <p class="muted" style="margin: 6px 0 0 0; font-size: 12px;">
-        Tries the credentials without saving. The AP stays up during the
-        check, so you won't be kicked off.
+    <div>
+      <label class="muted">Device name</label>
+      <InputText v-model="deviceName" fluid maxlength="31" placeholder="Carviston"
+                 @blur="saveDeviceName" @keyup.enter="saveDeviceName" />
+      <p class="muted" style="margin: 4px 0 0 0; font-size: 12px;">
+        Shown in the dashboard header and browser tab.
       </p>
     </div>
 
-    <div v-if="form.wifi_mode === 0 || form.wifi_mode === 2">
-      <label class="muted">AP SSID (blank = auto carviston-XXXXXX)</label>
-      <InputText v-model="form.ap_ssid" fluid />
-      <label class="muted">AP password (blank = open)</label>
-      <Password v-model="form.ap_pass" toggleMask :feedback="false" placeholder="leave blank to keep / be open" fluid />
+    <div class="app-grid-3">
+      <div>
+        <label class="muted">Temperature unit</label>
+        <Select v-model="form.dashboard_unit" :options="UNITS"
+                optionLabel="l" optionValue="v" fluid
+                @change="autoSave({ dashboard_unit: form.dashboard_unit })" />
+      </div>
+      <div>
+        <label class="muted">Power LED</label>
+        <Select v-model="form.power_led_mode" :options="POWER_LED_MODES"
+                optionLabel="l" optionValue="v" fluid
+                @change="autoSave({ power_led_mode: form.power_led_mode })" />
+      </div>
+      <div>
+        <label class="muted">ECO LED</label>
+        <Select v-model="form.eco_led_mode" :options="ECO_LED_MODES"
+                optionLabel="l" optionValue="v" fluid
+                @change="autoSave({ eco_led_mode: form.eco_led_mode })" />
+      </div>
     </div>
 
-    <Button label="Save network settings" @click="saveNetwork" />
+    <div class="row" style="gap: 10px; align-items: flex-start;">
+      <Checkbox v-model="restorePower" :binary="true" inputId="restore-power"
+                @change="onRestorePowerChange" />
+      <label for="restore-power" style="cursor: pointer; line-height: 1.4;">
+        Remember on/off state across restarts
+        <div class="muted" style="font-size: 12px; margin-top: 2px;">
+          On (default): after a reboot or power cut the heater returns to
+          whatever on/off state it was in. Off: it stays off until you press
+          power.
+        </div>
+      </label>
+    </div>
+
+    <div style="border-top: 1px solid var(--border); padding-top: 16px; margin-top: 8px;">
+      <h4 style="margin: 0 0 10px 0; font-size: 14px;">Password</h4>
+
+      <div class="app-grid-3 app-grid-align-center">
+        <Password v-model="oldPw" toggleMask :feedback="false"
+                  placeholder="Current password" fluid />
+        <Password v-model="newPw" toggleMask :feedback="false"
+                  placeholder="New password" fluid />
+        <Button label="Change password" severity="secondary" @click="changePassword" />
+      </div>
+      <p class="muted" style="margin: 6px 0 0 0; font-size: 12px;">
+        You'll be signed out after the password is changed.
+      </p>
+
+      <div class="row" style="gap: 10px; align-items: flex-start; margin-top: 16px;">
+        <Checkbox v-model="dashboardLocked" :binary="true" inputId="dash-lock"
+                  @change="onDashboardLockChange" />
+        <label for="dash-lock" style="cursor: pointer; line-height: 1.4;">
+          Require password to view the dashboard
+          <div class="muted" style="font-size: 12px; margin-top: 2px;">
+            Off (default): anyone on the network can view temperatures and
+            adjust controls. On: the dashboard also asks for the password.
+          </div>
+        </label>
+      </div>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.app-grid-3 {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+}
+.app-grid-align-center { align-items: center; }
+@media (max-width: 520px) {
+  .app-grid-3 { grid-template-columns: 1fr; }
+}
+</style>

@@ -15,28 +15,24 @@ Rev B — 2026-05-26.
 
 | Ref   | Qty | Part                       | Notes |
 |-------|-----|----------------------------|-------|
-| U1    | 1   | **HLK-PM01** AC→5 V SMPS    | Mean Well IRM-02-5 or equivalent also OK. ~0.6 A @ 5 V. |
-| U2    | 1   | **AMS1117-3.3** LDO         | 5 V → 3.3 V for MCU + ADS1115. |
+| U1    | 1   | **HLK-15M05C** AC→5 V SMPS  | Single 15 W / 3 A AC→5 V brick — covers the relay coils + elements' control draw with margin. **+3V3 is not generated here:** +5 V feeds the ESP32-S3 board's 5V-in and its onboard LDO supplies +3V3 to the logic / ADS1115 / NTC dividers. |
 | C1    | 1   | 470 µF / 16 V electrolytic | Bulk decoupling on +5 V rail. |
-| C2    | 1   | 10 µF / 10 V ceramic        | AMS1117 output cap. |
 | C3-C5 | 3   | 100 nF / 50 V ceramic       | Local decoupling near ESP32, ADS1115, relay module. |
 
 ## 3. Sensors
 
 | Ref     | Qty | Part                         | Notes |
 |---------|-----|------------------------------|-------|
-| —       | 2   | Ariston **dual-NTC immersion probe** | OEM. red = common (GND), black = NTC reg, yellow = NTC safety. ~10 kΩ @ 25 °C, β TBD (configured at runtime via NVS). |
+| —       | 2   | Ariston **dual-NTC immersion probe** | OEM, one per tank (inlet, outlet). red = common (GND), black = NTC reg, yellow = NTC safety; the two NTCs in a tank are cross-checked against each other. ~10 kΩ @ 25 °C, β TBD (configured at runtime via NVS). |
 | R1-R4   | 4   | 10 kΩ 1 % 0.25 W             | Divider tops: 3V3 → 10 kΩ → AINx → NTC → GND. |
 | RT1-RT4 | 4   | NTC thermistors              | Inside the two probes above (×2 NTCs per probe). |
 | R5, R6  | 2   | 4.7 kΩ 0.25 W                | I²C SDA/SCL pull-ups to +3V3. **Skip if your ADS1115 breakout already has them**. |
 
 ## 4. Safety
 
-| Ref | Qty | Part                            | Notes |
-|-----|-----|---------------------------------|-------|
-| SW1 | 1   | **KSD301** thermal cut-out ~95 °C, normally-closed | Wired in series with the JD-VCC rail of U5. Opening it drops both relay coils. **Hardware-only — firmware cannot override.** |
-| R7  | 1   | 10 kΩ 0.25 W                    | Cutoff-sense divider top. |
-| R8  | 1   | 4.7 kΩ 0.25 W                   | Cutoff-sense divider bottom. Tap → MCU IO21. |
+No hardware thermal cutoff. Over-temp protection is firmware-only: the soft
+limit in `safety.c` (90 °C) drops both relays when any tank crosses it. IO21 is
+free (was the cutoff-sense input).
 
 ## 5. User interface
 
@@ -44,7 +40,7 @@ Rev B — 2026-05-26.
 |----------|-----|---------------------------------------|-------|
 | D3-D10   | 8   | 5 mm LED                              | POWER, TEMP 40/50/60/70/80 °C, SHOWER-READY, ECO. Pick colour to taste. |
 | R9-R16   | 8   | 330 Ω 0.25 W                          | LED current limit, sized for ~10 mA from 3.3 V. |
-| SW2-SW6  | 5   | Momentary SPST pushbutton, NO         | POWER, ECO, SHOWER, PLUS, MINUS. Active-low; MCU internal pull-up enabled. |
+| SW2-SW6  | 5   | **Capacitive touch sensor** (active-HIGH) | POWER, ECO, SHOWER, PLUS, MINUS. Output goes HIGH when touched; the MCU's internal pull-down holds the pin LOW when idle (no external resistor). PLUS→IO41, MINUS→IO40 (swapped to match the as-built wiring). |
 
 ## 6. Loads
 
@@ -72,10 +68,8 @@ Rev B — 2026-05-26.
 ## Notes on U5 wiring
 
 ```
-   +5V ──┬─── KSD301 ─┬─── JD-VCC  (coil supply)
-         │            └─── VCC      (logic supply, jumpered to JD-VCC)
-         │
-        post-KSD also feeds cutoff-sense divider → IO21
+   +5V ──┬─── JD-VCC  (coil supply)
+         └─── VCC      (logic supply, jumpered to JD-VCC)
 
    IN1  ← ESP32 IO47   (active-LOW)
    IN2  ← ESP32 IO42   (active-LOW)

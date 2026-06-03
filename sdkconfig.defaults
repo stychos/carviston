@@ -24,6 +24,13 @@ CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 CONFIG_HTTPD_MAX_URI_LEN=1024
 
+# Raise the LWIP socket ceiling (default 10) so esp_http_server can run a
+# larger pool. The single httpd worker reserves 3 sockets; with 16 total that
+# leaves room for max_open_sockets=12 — enough headroom for two dashboard tabs
+# (each: one /ws + several keep-alive HTTP conns) plus reconnects, instead of
+# refusing connections at the 7-socket default. See web_server_start().
+CONFIG_LWIP_MAX_SOCKETS=16
+
 # mbedtls — HMAC/SHA256 already on by default; PBKDF2 is implemented in auth.c
 
 # Compiler

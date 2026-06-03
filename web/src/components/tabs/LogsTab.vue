@@ -2,10 +2,13 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import DataTable from 'primevue/datatable';
 import Column from 'primevue/column';
-import Tag from 'primevue/tag';
 import Button from 'primevue/button';
+import { useConfirm } from 'primevue/useconfirm';
+import { useToast } from 'primevue/usetoast';
 import { api } from '../../composables/api.js';
 
+const confirm = useConfirm();
+const toast = useToast();
 const data = ref({ events: [], current_boot: 0 });
 const loading = ref(false);
 let timer = null;
@@ -17,6 +20,36 @@ async function refresh() {
   finally { loading.value = false; }
 }
 
+/* Both clears are destructive and irreversible, so gate behind a confirm.
+ * Clearing the log also empties the heating-performance table — those rows are
+ * derived from bench_* events in the same log — which the message makes plain. */
+function clearLog() {
+  confirm.require({
+    header: 'Clear event log',
+    message: 'Delete all event-log entries? This also clears the heating performance history.',
+    icon: 'pi pi-trash',
+    acceptLabel: 'Clear', rejectLabel: 'Cancel', acceptProps: { severity: 'danger' },
+    accept: async () => {
+      try { await api.post('/api/log/clear'); await refresh();
+            toast.add({ severity: 'success', summary: 'Event log cleared', life: 1500 }); }
+      catch (e) { toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 }); }
+    },
+  });
+}
+function clearBenchmarks() {
+  confirm.require({
+    header: 'Clear heating performance',
+    message: 'Delete all recorded heating runs? The rest of the event log is kept.',
+    icon: 'pi pi-trash',
+    acceptLabel: 'Clear', rejectLabel: 'Cancel', acceptProps: { severity: 'danger' },
+    accept: async () => {
+      try { await api.post('/api/benchmarks/clear'); await refresh();
+            toast.add({ severity: 'success', summary: 'Heating performance cleared', life: 1500 }); }
+      catch (e) { toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 }); }
+    },
+  });
+}
+
 onMounted(() => { refresh(); timer = setInterval(refresh, 5000); });
 onUnmounted(() => { if (timer) clearInterval(timer); });
 
@@ -24,24 +57,24 @@ onUnmounted(() => { if (timer) clearInterval(timer); });
  * through to the original string so log entries stay debuggable when the
  * backend adds something new. */
 const EVENT_LABELS = {
-  boot: 'Boot', shutdown: 'Shutdown', reboot_request: 'Reboot requested',
-  factory_reset: 'Factory reset',
-  wifi_ap: 'AP started',
-  wifi_sta_connected: 'Wi-Fi connected', wifi_sta_disconnected: 'Wi-Fi lost',
-  time_synced: 'Time synced',
-  button_press: 'Button press', button_long: 'Button held',
+  boot: 'Started up', shutdown: 'Shutting down', reboot_request: 'Reboot requested',
+  factory_reset: 'Hardware reset',
+  wifi_ap: 'Hotspot started',
+  wifi_sta_connected: 'Connected to Wi-Fi', wifi_sta_disconnected: 'Wi-Fi connection lost',
+  time_synced: 'Clock synchronised',
+  button_press: 'Button pressed', button_long: 'Button held',
   mode_change: 'Mode changed', target_change: 'Target changed',
-  master_on: 'Heaters on', master_off: 'Heaters off',
+  master_on: 'Heaters turned on', master_off: 'Heaters turned off',
   heater_on: 'Heater on', heater_off: 'Heater off',
-  safety_fault: 'Safety fault', safety_cleared: 'Safety cleared',
+  safety_fault: 'Safety issue', safety_cleared: 'Safety cleared',
   ota_start: 'Update started', ota_done: 'Update complete', ota_fail: 'Update failed',
-  bench_start: 'Benchmark start', bench_end: 'Benchmark done', bench_abort: 'Benchmark abort',
+  bench_start: 'Heating test started', bench_end: 'Heating test complete', bench_abort: 'Heating test cancelled',
 };
 function labelFor(type) { return EVENT_LABELS[type] || type; }
 
 const MODE_NAMES = ['Super-fast', 'Fast', 'Optimal', 'Eco'];
 const BUTTON_NAMES = ['Power', 'ECO', 'Shower', 'Plus', 'Minus'];
-const SAFETY_NAMES = ['OK', 'Cutoff', 'Probe fault', 'Over-temp', 'No probes'];
+const SAFETY_NAMES = ['All clear', 'Safety switch tripped', 'Sensor problem', 'Water too hot', 'No sensors'];
 
 function fmtAbsolute(ev) {
   if (ev.ts > 1700000000) {
@@ -78,7 +111,7 @@ function fmtPayload(ev) {
     case 'heater_off':    return `heater ${ev.a + 1}`;
     case 'safety_fault':  return SAFETY_NAMES[ev.a] || `#${ev.a}`;
     case 'reboot_request':
-      return ev.a === 0 || ev.a === 1 ? `→ OTA ${ev.a}` : '';
+      return ev.a === 0 || ev.a === 1 ? `→ Firmware ${ev.a === 0 ? 'A' : 'B'}` : '';
     default: return '';
   }
 }
@@ -133,7 +166,11 @@ const benchmarks = computed(() => {
   <div class="stack">
     <div class="spaced">
       <h4 style="margin: 0;">Event log</h4>
-      <Button label="Refresh" size="small" icon="pi pi-refresh" text :loading="loading" @click="refresh" />
+      <div class="row" style="gap: 2px;">
+        <Button label="Clear" size="small" icon="pi pi-trash" text severity="danger"
+                :disabled="!eventsView.length" @click="clearLog" />
+        <Button label="Refresh" size="small" icon="pi pi-refresh" text :loading="loading" @click="refresh" />
+      </div>
     </div>
 
     <div v-if="!eventsView.length" class="muted" style="padding: 24px 0; text-align: center;">
@@ -142,12 +179,16 @@ const benchmarks = computed(() => {
     <div v-else class="log-list">
       <div v-for="(ev, i) in eventsView" :key="i" class="log-row">
         <div class="log-time" :title="fmtAbsolute(ev)">{{ fmtRelative(ev) }}</div>
-        <Tag :severity="severityFor(ev.type)" :value="labelFor(ev.type)" />
+        <span class="log-type" :class="`log-type-${severityFor(ev.type)}`">{{ labelFor(ev.type) }}</span>
         <div class="log-detail">{{ fmtPayload(ev) }}</div>
       </div>
     </div>
 
-    <h4 style="margin: 16px 0 0;">Heating benchmarks</h4>
+    <div class="spaced" style="margin-top: 16px;">
+      <h4 style="margin: 0;">Heating performance</h4>
+      <Button label="Clear" size="small" icon="pi pi-trash" text severity="danger"
+              :disabled="!benchmarks.length" @click="clearBenchmarks" />
+    </div>
     <DataTable v-if="benchmarks.length" :value="benchmarks" size="small" stripedRows
                scrollable scrollHeight="200px" :paginator="false">
       <Column header="Started">
@@ -179,7 +220,7 @@ const benchmarks = computed(() => {
       </Column>
     </DataTable>
     <div v-else class="muted" style="padding: 16px 0; text-align: center;">
-      No benchmarks recorded.
+      No heating runs recorded yet.
     </div>
   </div>
 </template>
@@ -206,6 +247,17 @@ const benchmarks = computed(() => {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.log-type {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--text);
+}
+.log-type-success   { color: var(--good); }
+.log-type-warn      { color: var(--warn); }
+.log-type-danger    { color: var(--bad);  }
+.log-type-info      { color: var(--accent); }
+.log-type-secondary { color: var(--text); }
 .log-detail {
   color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

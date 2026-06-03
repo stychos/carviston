@@ -5,9 +5,56 @@
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
     <meta name="theme-color" content="#0d1117" />
     <title>Carviston</title>
+    <!-- Apply the saved theme before the bundle loads, so there's no flash of
+         the wrong palette on first paint. Mirrors composables/theme.js. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('carviston-theme') || 'auto';
+          var dark = t === 'dark' ||
+            (t === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark-mode');
+        } catch (e) { /* default to light */ }
+      })();
+    </script>
+    <!-- Boot splash. Inlined here (NOT in the bundle's style.css) on purpose:
+         on an uncached load the ~210 KB SPA bundle takes seconds to arrive over
+         a poor link, and until it executes #app would be empty — just the page
+         background, which reads as "broken". This markup + CSS ship in the HTML
+         itself, so a spinner paints the instant the document lands. The bg
+         colours mirror style.css's --bg (light/dark) so there's no flash when
+         the bundle's real styles take over. App.vue's `loading` view reuses
+         these same classes, so Vue's first paint continues the same spinner
+         (cached load) with no flicker before auth status is known. -->
+    <style>
+      .boot-splash {
+        position: fixed; inset: 0; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; gap: 16px;
+        background: #eef1f5;
+        font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: #59636e;
+      }
+      .dark-mode .boot-splash { background: #0d1117; color: #8b949e; }
+      .boot-spinner {
+        width: 38px; height: 38px; border-radius: 50%;
+        border: 3px solid rgba(128, 128, 128, 0.3);
+        border-top-color: #2f81f7;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      .boot-status { min-height: 1.2em; }
+      @keyframes boot-spin { to { transform: rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-spinner { animation-duration: 2s; }
+      }
+    </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <div class="boot-splash">
+        <div class="boot-spinner"></div>
+        <div class="boot-status">Loading&hellip;</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

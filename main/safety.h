@@ -1,16 +1,17 @@
-/* safety — hardware cutoff sense + fault aggregation.
+/* safety — over-temp + total-sensor-loss aggregation.
  *
- *   GPIO21 (input, internal pull-down enabled — see safety.c): senses the
- *   KSD301 hardware cutoff continuity through an external divider on the
- *   post-KSD +5 V rail (relay module's JD-VCC line). When the KSD301 trips,
- *   that rail collapses and firmware sees LOW → SAFETY_FAULT_CUTOFF. Internal
- *   pull-up stays disabled (it would mask a tripped rail); internal pull-down
- *   IS enabled so a broken sense wire also reads LOW instead of floating
- *   HIGH from leakage and silently defeating the fail-safe. The hardware
- *   cutoff itself is unaffected by firmware.
+ * Two global hazards stop the system:
+ *   - OVERTEMP: a tank crosses the firmware soft limit (the sole over-temp
+ *     protection — there is no hardware thermal cutoff). Real-time, immediate.
+ *   - NO_PROBES: BOTH tanks lose their sensors, leaving no usable temperature.
+ * A SINGLE tank's probe failing is NOT a global fault — heater_control gates
+ * that tank's element off while the healthy tank keeps heating.
  *
- * Faults are sticky from this module's view — once we see a fault, we report
- * faulted until safety_clear_fault() is called (typically from the UI).
+ * A fault latches (drops the relays the instant it appears) but AUTO-RECOVERS:
+ * safety_evaluate() keeps re-checking the live inputs each tick, and once the
+ * condition has read clear for a short recovery window the latch drops on its
+ * own and heating resumes — no user action required. safety_clear_fault()
+ * still exists for an explicit manual reset from the UI/Matter.
  *
  * safety_evaluate() should be called periodically (e.g. once per heater_control
  * tick) with the latest temperature reading. It updates the cached state.
@@ -30,10 +31,8 @@ extern "C" {
 
 typedef enum {
     SAFETY_OK = 0,
-    SAFETY_FAULT_CUTOFF,       /* hardware cutoff has tripped */
-    SAFETY_FAULT_PROBE,        /* probe disagreement / sensor failure */
-    SAFETY_FAULT_OVERTEMP,     /* water temp exceeds soft limit (95C) */
-    SAFETY_FAULT_NO_PROBES,    /* all probes faulted, no valid reading */
+    SAFETY_FAULT_OVERTEMP,     /* a tank exceeds the soft over-temp limit (90C) */
+    SAFETY_FAULT_NO_PROBES,    /* all tanks faulted — no usable reading */
 } safety_status_t;
 
 esp_err_t safety_init(void);
@@ -47,12 +46,10 @@ safety_status_t safety_status(void);
 /* True iff status == SAFETY_OK. Used by heater_control before energising. */
 bool safety_is_ok(void);
 
-/* Clear sticky fault (from UI). Cutoff sense still gates this — clearing
- * while the cutoff is open will immediately re-latch the fault. */
+/* Explicit manual reset (from UI/Matter). The fault re-latches on the next
+ * evaluate if its condition still holds; normally the latch auto-recovers on
+ * its own, so this is only for forcing an immediate clear. */
 void safety_clear_fault(void);
-
-/* Cutoff sense raw read (true = continuity intact). */
-bool safety_cutoff_intact(void);
 
 #ifdef __cplusplus
 }

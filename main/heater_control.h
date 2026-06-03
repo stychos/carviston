@@ -25,7 +25,8 @@ extern "C" {
 
 /* Snapshot of runtime state, sampled atomically. */
 typedef struct {
-    bool   master_enabled;
+    bool   master_enabled;       /* derived: true iff any element is enabled */
+    bool   element_enabled[2];   /* user intent per heating element */
     heating_mode_t mode;
     uint8_t target_c;
 
@@ -45,8 +46,16 @@ esp_err_t heater_control_init(void);
 /* External setters — thread-safe. */
 void heater_set_target(uint8_t celsius);
 void heater_set_mode(heating_mode_t mode);
-void heater_set_master_enabled(bool on);
-void heater_toggle_master(void);   /* convenience — what the power button does */
+void heater_set_master_enabled(bool on);     /* enables/disables both elements */
+void heater_toggle_master(void);              /* convenience — what the power button does */
+
+/* Per-element user enable. Independent of mode logic — the mode state
+ * machine still decides when each enabled element fires, but a disabled
+ * element will never close its relay. With both disabled, the system
+ * is effectively off (master_enabled is reported as false). `channel`
+ * is 0 or 1 (heater 1 / heater 2). */
+void heater_set_element_enabled(uint8_t channel, bool on);
+void heater_toggle_element(uint8_t channel);
 
 /* Clear a latched safety fault. Forces master_enabled=false at the same time
  * so heating can't auto-resume the moment the latch drops — the user must
