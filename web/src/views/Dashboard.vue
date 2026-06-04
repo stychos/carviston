@@ -132,10 +132,13 @@ const safety_class = computed(() => {
   return s === 0 ? 'good' : 'bad';
 });
 
+/* Headline is a glance value, so round to a whole degree — a 3-digit Fahrenheit
+ * reading plus a decimal overflows the gauge. Precise tenths are in the tank
+ * rows just below. */
 const water = computed(() => {
   const w = pickTemp(state.value, 'water');
   if (w == null) return '—';
-  return w.toFixed(1);
+  return String(Math.round(w));
 });
 const targetDisplay = computed(() => {
   const t = pickTemp(state.value, 'target');
