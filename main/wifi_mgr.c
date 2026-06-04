@@ -113,6 +113,14 @@ static EventGroupHandle_t s_test_events;
 static volatile bool     s_testing;
 static volatile uint8_t  s_test_disconnect_reason;
 
+/* Async-test plumbing (pure-STA path): params captured for the worker, and the
+ * pollable result, guarded by s_async_lock. */
+static SemaphoreHandle_t s_async_lock;
+static wifi_test_async_t s_async;
+static char              s_async_ssid[33];
+static char              s_async_pass[65];
+static int               s_async_timeout;
+
 static void on_sntp_sync(struct timeval *tv)
 {
     (void)tv;
@@ -643,12 +651,13 @@ esp_err_t wifi_mgr_test_sta(const char *ssid, const char *password,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Refuse if we're in pure STA — testing would knock the caller off. */
+    /* Any started mode is testable now. Pure STA drops the live link for the
+     * test window and rejoins the remembered network afterwards (see the rejoin
+     * at the end) — callers reached over that link must use the async path. */
     wifi_mode_t prev_mode = WIFI_MODE_NULL;
     esp_wifi_get_mode(&prev_mode);
-    if (prev_mode != WIFI_MODE_AP && prev_mode != WIFI_MODE_APSTA) {
-        snprintf(out->error, sizeof(out->error),
-                 "switch the device to AP mode before testing");
+    if (prev_mode == WIFI_MODE_NULL) {
+        snprintf(out->error, sizeof(out->error), "wi-fi is not running");
         xSemaphoreGive(s_test_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -718,10 +727,85 @@ esp_err_t wifi_mgr_test_sta(const char *ssid, const char *password,
     s_intentional_stop = prev_intentional;
     reset_reconnect_backoff();
 
+    /* If we tore down a live STA link to run the test (pure STA, or APSTA with a
+     * real saved network), actively rejoin it now. Events flow normally again
+     * (s_testing is clear), so the state machine tracks the reconnect and
+     * SNTP/mDNS re-arm on GOT_IP. The pure-AP case leaves prev_sta empty. */
+    if (!promoted && prev_sta.sta.ssid[0] != '\0') {
+        s_state = WIFI_STATE_STA_CONNECTING;
+        esp_wifi_connect();
+    }
+
     out->ok = ok;
     if (!ok) {
         strlcpy(out->error, disconnect_reason_str(reason), sizeof(out->error));
     }
     xSemaphoreGive(s_test_lock);
     return ESP_OK;
+}
+
+bool wifi_mgr_ap_serving(void) { return s_ap_active; }
+
+/* Background worker for the async (pure-STA) test path. Params were captured
+ * under s_async_lock before the task was created. */
+static void test_async_task(void *arg)
+{
+    (void)arg;
+    /* Let the HTTP handler flush its "{async:true}" reply before we drop the STA
+     * link the request rode in on — otherwise the browser sees a dead socket
+     * instead of the acknowledgement and never starts polling. */
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    wifi_test_result_t r;
+    esp_err_t err = wifi_mgr_test_sta(s_async_ssid, s_async_pass, s_async_timeout, &r);
+
+    xSemaphoreTake(s_async_lock, portMAX_DELAY);
+    s_async.running = false;
+    s_async.done    = true;
+    s_async.ok      = (err == ESP_OK) && r.ok;
+    if (s_async.ok) {
+        s_async.error[0] = '\0';
+    } else {
+        strlcpy(s_async.error, r.error[0] ? r.error : "test failed", sizeof(s_async.error));
+    }
+    xSemaphoreGive(s_async_lock);
+    vTaskDelete(NULL);
+}
+
+esp_err_t wifi_mgr_test_sta_async(const char *ssid, const char *password, int timeout_s)
+{
+    if (!ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
+    if (!s_async_lock) s_async_lock = xSemaphoreCreateMutex();
+    if (!s_async_lock) return ESP_ERR_NO_MEM;
+
+    xSemaphoreTake(s_async_lock, portMAX_DELAY);
+    if (s_async.running) {
+        xSemaphoreGive(s_async_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_async.running  = true;
+    s_async.done     = false;
+    s_async.ok       = false;
+    s_async.error[0] = '\0';
+    strlcpy(s_async_ssid, ssid, sizeof(s_async_ssid));
+    strlcpy(s_async_pass, password ? password : "", sizeof(s_async_pass));
+    s_async_timeout  = timeout_s;
+    xSemaphoreGive(s_async_lock);
+
+    if (xTaskCreate(test_async_task, "wifi_test", 4096, NULL, 4, NULL) != pdPASS) {
+        xSemaphoreTake(s_async_lock, portMAX_DELAY);
+        s_async.running = false;
+        xSemaphoreGive(s_async_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void wifi_mgr_test_result(wifi_test_async_t *out)
+{
+    if (!out) return;
+    if (!s_async_lock) { memset(out, 0, sizeof(*out)); return; }
+    xSemaphoreTake(s_async_lock, portMAX_DELAY);
+    *out = s_async;
+    xSemaphoreGive(s_async_lock);
 }

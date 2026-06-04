@@ -97,15 +97,6 @@ body { overscroll-behavior: none; }
   display: flex; align-items: center; gap: 9px;
   font-size: 20px; font-weight: 600; letter-spacing: 0.4px;
 }
-/* Small heat-coloured mark — gives the wordmark a point of view without a
- * webfont. Glows faintly so it reads as a pilot light. */
-.brand-mark {
-  width: 10px; height: 10px; border-radius: 3px;
-  background: linear-gradient(140deg, var(--heat) 0%, #ffb347 100%);
-  box-shadow: 0 0 12px var(--heat-soft);
-  flex: none;
-}
-
 .muted { color: var(--muted); }
 
 .stack { display: grid; gap: 16px; }

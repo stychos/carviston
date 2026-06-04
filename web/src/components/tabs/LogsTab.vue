@@ -6,6 +6,7 @@ import Button from 'primevue/button';
 import { useConfirm } from 'primevue/useconfirm';
 import { useToast } from 'primevue/usetoast';
 import { api } from '../../composables/api.js';
+import { isFahrenheit, cToF, unitSuffix } from '../../composables/units.js';
 
 const confirm = useConfirm();
 const toast = useToast();
@@ -100,10 +101,15 @@ function fmtRelative(ev) {
   return 'just now';
 }
 
+/* Benchmark start/end temps are stored Celsius; show them in the active unit. */
+function dispTemp(c) {
+  return (isFahrenheit.value ? cToF(c) : c).toFixed(1);
+}
+
 function fmtPayload(ev) {
   if (ev.text) return ev.text;
   switch (ev.type) {
-    case 'target_change': return `→ ${ev.a}°C`;
+    case 'target_change': return `→ ${isFahrenheit.value ? Math.round(cToF(ev.a)) : ev.a}${unitSuffix.value}`;
     case 'mode_change':   return MODE_NAMES[ev.a] || `mode ${ev.a}`;
     case 'button_press':
     case 'button_long':   return BUTTON_NAMES[ev.a] || `button ${ev.a}`;
@@ -201,7 +207,7 @@ const benchmarks = computed(() => {
       </Column>
       <Column header="From → to">
         <template #body="{ data }">
-          <span v-if="data.start_c != null">{{ data.start_c.toFixed(1) }}° → {{ data.end_c.toFixed(1) }}°</span>
+          <span v-if="data.start_c != null">{{ dispTemp(data.start_c) }}° → {{ dispTemp(data.end_c) }}°</span>
           <span v-else class="muted">—</span>
         </template>
       </Column>

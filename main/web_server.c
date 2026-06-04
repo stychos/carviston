@@ -240,6 +240,20 @@ static esp_err_t api_auth_logout(httpd_req_t *req)
 
 /* ---------- state ---------- */
 
+/* Emit a temperature as BOTH "<base>_c" and "<base>_f" so any client picks the
+ * unit it wants without a query param — the device stays canonical Celsius and
+ * the field names stay self-describing. `valid` false renders both as null (a
+ * faulted probe). */
+static void add_temp_cf(cJSON *o, const char *base, float c, bool valid)
+{
+    char key[40];
+    snprintf(key, sizeof key, "%s_c", base);
+    if (valid) cJSON_AddNumberToObject(o, key, c); else cJSON_AddNullToObject(o, key);
+    snprintf(key, sizeof key, "%s_f", base);
+    if (valid) cJSON_AddNumberToObject(o, key, c * 9.0f / 5.0f + 32.0f);
+    else       cJSON_AddNullToObject(o, key);
+}
+
 static cJSON *state_json(void)
 {
     heater_state_t st;
@@ -250,25 +264,24 @@ static cJSON *state_json(void)
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "device_name", devname);
-    cJSON_AddNumberToObject(o, "target_c", st.target_c);
+    /* The user's preferred display unit (0=C, 1=F); the client reads the
+     * matching _c/_f fields. Telemetry stays dual-unit regardless. */
+    cJSON_AddNumberToObject(o, "display_unit", app_config_get_dashboard_unit());
+    add_temp_cf(o, "target", st.target_c, true);
     cJSON_AddNumberToObject(o, "mode", st.mode);
     cJSON_AddBoolToObject(o, "master_enabled", st.master_enabled);
     cJSON *elements = cJSON_CreateArray();
     cJSON_AddItemToArray(elements, cJSON_CreateBool(st.element_enabled[0]));
     cJSON_AddItemToArray(elements, cJSON_CreateBool(st.element_enabled[1]));
     cJSON_AddItemToObject(o, "element_enabled", elements);
-    if (!st.temp.all_fault) {
-        cJSON_AddNumberToObject(o, "water_c", st.temp.water_c);
-    } else {
-        cJSON_AddNullToObject(o, "water_c");
-    }
+    add_temp_cf(o, "water", st.temp.water_c, !st.temp.all_fault);
     static const char *const tank_names[TANK_COUNT] = { "Inlet tank", "Outlet tank" };
     cJSON *tanks = cJSON_CreateArray();
     for (int i = 0; i < TANK_COUNT; ++i) {
         cJSON *p = cJSON_CreateObject();
         cJSON_AddStringToObject(p, "name",         tank_names[i]);
-        cJSON_AddNumberToObject(p, "regulation_c", st.temp.tank[i].regulation_c);
-        cJSON_AddNumberToObject(p, "safety_c",     st.temp.tank[i].safety_c);
+        add_temp_cf(p, "regulation", st.temp.tank[i].regulation_c, true);
+        add_temp_cf(p, "safety",     st.temp.tank[i].safety_c,     true);
         cJSON_AddBoolToObject(p, "fault",          st.temp.tank[i].fault);
         cJSON_AddItemToArray(tanks, p);
     }
@@ -518,10 +531,15 @@ static esp_err_t api_heater_target(httpd_req_t *req)
     if (!require_dashboard(req)) return ESP_OK;
     cJSON *body = read_json_body(req);
     if (!body) return send_error(req, 400, "invalid body");
+    /* Accept either unit; the device is canonical Celsius. Fahrenheit is rounded
+     * to the nearest whole degree C (positive range, so +0.5 rounding is safe). */
     const cJSON *c = cJSON_GetObjectItemCaseSensitive(body, "celsius");
-    int v = cJSON_IsNumber(c) ? c->valueint : 0;
+    const cJSON *f = cJSON_GetObjectItemCaseSensitive(body, "fahrenheit");
+    int v = 0;
+    if (cJSON_IsNumber(c))      v = c->valueint;
+    else if (cJSON_IsNumber(f)) v = (int)((f->valuedouble - 32.0) * 5.0 / 9.0 + 0.5);
     cJSON_Delete(body);
-    if (v < 40 || v > 80) return send_error(req, 400, "celsius must be 40..80");
+    if (v < 40 || v > 80) return send_error(req, 400, "target must be 40..80 C (104..176 F)");
     heater_set_target((uint8_t)v);
     return send_json(req, state_json(), 200);
 }
@@ -597,21 +615,49 @@ static esp_err_t api_wifi_test(httpd_req_t *req)
     const char *pass = (cJSON_IsString(pass_j) && pass_j->valuestring) ? pass_j->valuestring : "";
     int timeout_s = (cJSON_IsNumber(to_j)) ? to_j->valueint : 12;
 
-    wifi_test_result_t r;
-    esp_err_t err = wifi_mgr_test_sta(ssid, pass, timeout_s, &r);
+    /* Pick the transport by whether an AP is currently serving. With an AP up
+     * (first-time setup from the hotspot, or the recovery AP) the browser's link
+     * survives the test, so run it synchronously and answer on this request. In
+     * pure STA the test must drop the very link carrying this request, so start
+     * it in the background and let the client poll /api/wifi/test/result once the
+     * device has rejoined the network. */
+    if (wifi_mgr_ap_serving()) {
+        wifi_test_result_t r;
+        esp_err_t err = wifi_mgr_test_sta(ssid, pass, timeout_s, &r);
+        cJSON_Delete(body);
+        if (err == ESP_ERR_INVALID_STATE)
+            return send_error(req, 409, r.error[0] ? r.error : "cannot test now");
+        if (err != ESP_OK)
+            return send_error(req, 500, r.error[0] ? r.error : "test failed");
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddBoolToObject  (o, "async", false);
+        cJSON_AddBoolToObject  (o, "ok",    r.ok);
+        cJSON_AddStringToObject(o, "error", r.error);
+        return send_json(req, o, 200);
+    }
+
+    esp_err_t err = wifi_mgr_test_sta_async(ssid, pass, timeout_s);
     cJSON_Delete(body);
-
-    if (err == ESP_ERR_INVALID_STATE) {
-        /* Test couldn't be run at all (busy, or device is in pure STA mode). */
-        return send_error(req, 409, r.error[0] ? r.error : "cannot test now");
-    }
-    if (err != ESP_OK) {
-        return send_error(req, 500, r.error[0] ? r.error : "test failed");
-    }
-
+    if (err == ESP_ERR_INVALID_STATE)
+        return send_error(req, 409, "another test in progress");
+    if (err != ESP_OK)
+        return send_error(req, 500, "could not start test");
+    /* 200 (not 202): send_json maps any unlisted status to 500; the async flag
+     * in the body is what tells the client to switch to polling. */
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (o, "ok",    r.ok);
-    cJSON_AddStringToObject(o, "error", r.error);
+    cJSON_AddBoolToObject(o, "async", true);
+    return send_json(req, o, 200);
+}
+
+static esp_err_t api_wifi_test_result(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    wifi_test_async_t a;
+    wifi_mgr_test_result(&a);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "state", a.running ? "running" : (a.done ? "done" : "idle"));
+    cJSON_AddBoolToObject  (o, "ok",    a.ok);
+    cJSON_AddStringToObject(o, "error", a.error);
     return send_json(req, o, 200);
 }
 
@@ -1114,6 +1160,7 @@ esp_err_t web_server_start(void)
 
     ROUTE("/api/wifi/scan",     HTTP_GET,  api_wifi_scan);
     ROUTE("/api/wifi/test",     HTTP_POST, api_wifi_test);
+    ROUTE("/api/wifi/test/result", HTTP_GET, api_wifi_test_result);
 
     ROUTE("/api/maintenance/reboot",        HTTP_POST, api_reboot);
     ROUTE("/api/maintenance/factory_reset", HTTP_POST, api_factory_reset);

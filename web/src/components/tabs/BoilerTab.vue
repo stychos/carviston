@@ -3,6 +3,7 @@ import { reactive, watch } from 'vue';
 import InputNumber from 'primevue/inputnumber';
 import Button from 'primevue/button';
 import { useToast } from 'primevue/usetoast';
+import { tempField, unitSuffix } from '../../composables/units.js';
 
 const props = defineProps({
   cfg: Object,
@@ -12,6 +13,15 @@ const toast = useToast();
 
 const form = reactive({ ...props.cfg });
 watch(() => props.cfg, c => Object.assign(form, c));
+
+/* Temperature fields edit in the active unit but persist canonical Celsius.
+ * shower-ready is an absolute temp; hysteresis and mismatch are spans (delta). */
+const { model: showerReady, min: showerMin, max: showerMax } =
+  tempField(form, 'shower_ready_c', 30, 70);
+const { model: hysteresis, min: hystMin, max: hystMax } =
+  tempField(form, 'hysteresis_c', 1, 10, { delta: true });
+const { model: mismatch, min: mismatchMin, max: mismatchMax } =
+  tempField(form, 'probe_disagree_c', 1, 20, { delta: true });
 
 async function save() {
   /* heating_mode lives on the dashboard now — don't echo it back from the
@@ -45,8 +55,8 @@ async function save() {
         <InputNumber v-model="form.optimal_swap_min" :min="1" :max="120" fluid showButtons />
       </div>
       <div style="flex:1">
-        <label class="muted">Hysteresis (°C)</label>
-        <InputNumber v-model="form.hysteresis_c" :min="1" :max="10" fluid showButtons />
+        <label class="muted">Hysteresis ({{ unitSuffix }})</label>
+        <InputNumber v-model="hysteresis" :min="hystMin" :max="hystMax" fluid showButtons />
       </div>
     </div>
     <div class="row" style="gap: 12px;">
@@ -61,8 +71,8 @@ async function save() {
     </div>
 
     <div>
-      <label class="muted">Shower-ready threshold (°C)</label>
-      <InputNumber v-model="form.shower_ready_c" :min="30" :max="70" fluid showButtons />
+      <label class="muted">Shower-ready threshold ({{ unitSuffix }})</label>
+      <InputNumber v-model="showerReady" :min="showerMin" :max="showerMax" fluid showButtons />
     </div>
 
     <details class="muted" style="margin-top: 4px;">
@@ -77,8 +87,8 @@ async function save() {
           <InputNumber v-model="form.ntc_beta" :min="2000" :max="5500" fluid />
         </div>
         <div style="flex:1">
-          <label class="muted">Mismatch threshold (°C)</label>
-          <InputNumber v-model="form.probe_disagree_c" :min="1" :max="20" fluid />
+          <label class="muted">Mismatch threshold ({{ unitSuffix }})</label>
+          <InputNumber v-model="mismatch" :min="mismatchMin" :max="mismatchMax" fluid />
         </div>
       </div>
     </details>

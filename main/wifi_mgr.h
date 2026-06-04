@@ -83,6 +83,11 @@ int8_t wifi_mgr_rssi(void);
 /* Scan nearby APs (synchronous, ~3s). Fills entries up to max_entries; returns count. */
 int wifi_mgr_scan(wifi_scan_entry_t *entries, int max_entries);
 
+/* True if a SoftAP is currently serving (pure AP, or the APSTA recovery AP).
+ * Used to decide whether a connection test can run synchronously: when an AP is
+ * up the caller's link survives the test; in pure STA it does not. */
+bool wifi_mgr_ap_serving(void);
+
 typedef struct {
     bool ok;
     char error[64];   /* human-readable failure reason; empty on success */
@@ -92,15 +97,34 @@ typedef struct {
  * up to `timeout_s` seconds. The radio is restored to the prior config
  * regardless of outcome; the call does NOT persist anything to NVS.
  *
- * Must be called while the AP is up (pure AP or the APSTA recovery AP). Returns
- * ESP_ERR_INVALID_STATE if currently in pure STA mode, since testing
- * would otherwise disconnect the caller.
+ * Works from any started mode. In pure STA it drops the live link to run the
+ * test and then actively rejoins the remembered network — so it BLOCKS for the
+ * whole window and the caller (if reached over that link) is cut off; prefer
+ * wifi_mgr_test_sta_async() there. Synchronous use is for when an AP is up.
  *
  * Returns ESP_OK with out->ok=true on association+IP within timeout;
  * ESP_OK with out->ok=false and out->error populated on failure;
  * ESP_ERR_* if the request can't be attempted at all. */
 esp_err_t wifi_mgr_test_sta(const char *ssid, const char *password,
                             int timeout_s, wifi_test_result_t *out);
+
+typedef struct {
+    bool running;     /* an async test is in progress */
+    bool done;        /* a finished result is available (cleared when a new test starts) */
+    bool ok;          /* verdict of the last finished test */
+    char error[64];
+} wifi_test_async_t;
+
+/* Run wifi_mgr_test_sta() on a background task and return immediately. For pure
+ * STA, where the test must drop the very link carrying the HTTP request: the
+ * caller answers the client right away, the device disconnects → tests → rejoins
+ * the remembered network, and the client polls wifi_mgr_test_result() once it
+ * can reach the device again. Returns ESP_ERR_INVALID_STATE if a test is already
+ * running. */
+esp_err_t wifi_mgr_test_sta_async(const char *ssid, const char *password, int timeout_s);
+
+/* Snapshot the async-test state (running/done/ok/error). */
+void wifi_mgr_test_result(wifi_test_async_t *out);
 
 #ifdef __cplusplus
 }

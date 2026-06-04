@@ -163,9 +163,9 @@ async function changePassword() {
         <InputText v-model="hostname" fluid maxlength="31" placeholder="carviston"
                    @blur="saveHostname" @keyup.enter="saveHostname" />
         <p class="muted" style="margin: 4px 0 0 0; font-size: 12px;">
-          How the device appears on your router and at
-          <code>{{ (hostname || 'carviston') }}.local</code>. Lowercase letters,
-          numbers and hyphens only. Changing it briefly reconnects Wi-Fi.
+          The device's name on your router and at
+          <code>{{ (hostname || 'carviston') }}.local</code>. Letters, numbers
+          and hyphens only.
         </p>
       </div>
     </div>

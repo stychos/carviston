@@ -92,6 +92,35 @@ watch(() => form.wifi_mode, (m) => {
   if (m === 0) { form.sta_ssid = ''; form.sta_pass = ''; lastTested.value = null; }
 });
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function applyVerdict(ok, error) {
+  if (ok) {
+    lastTested.value = { ssid: form.sta_ssid, pass: form.sta_pass };
+    toast.add({ severity: 'success', summary: 'Connected — credentials work',
+                detail: 'You can save these settings now', life: 4000 });
+  } else {
+    lastTested.value = null;
+    toast.add({ severity: 'error', summary: 'Could not connect',
+                detail: error || 'unknown reason', life: 4000 });
+  }
+}
+
+/* Async (pure-STA) path: the device drops our link to run the test, then rejoins
+ * the saved network. Poll the result endpoint THROUGH that outage — network
+ * errors just mean it hasn't come back yet — until 'done' or a hard deadline. */
+async function pollTestResult() {
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    try {
+      const s = await api.get('/api/wifi/test/result');
+      if (s.state === 'done') return { ok: s.ok, error: s.error };
+    } catch { /* device offline mid-test — keep waiting */ }
+  }
+  return { ok: false, error: 'timed out waiting for the device to come back' };
+}
+
 async function testCredentials() {
   if (!form.sta_ssid) {
     toast.add({ severity: 'warn', summary: 'Pick a network first', life: 2500 });
@@ -104,14 +133,14 @@ async function testCredentials() {
       password: form.sta_pass,
       timeout_s: 12,
     });
-    if (r.ok) {
-      lastTested.value = { ssid: form.sta_ssid, pass: form.sta_pass };
-      toast.add({ severity: 'success', summary: 'Connected — credentials work',
-                  detail: 'You can save these settings now', life: 4000 });
+    if (r.async) {
+      /* Device is about to disconnect to test, then come back on its own. */
+      toast.add({ severity: 'info', summary: 'Testing…',
+                  detail: 'The device disconnects briefly, then reconnects.', life: 3500 });
+      const res = await pollTestResult();
+      applyVerdict(res.ok, res.error);
     } else {
-      lastTested.value = null;
-      toast.add({ severity: 'error', summary: 'Could not connect',
-                  detail: r.error || 'unknown reason', life: 4000 });
+      applyVerdict(r.ok, r.error);
     }
   } catch (e) {
     lastTested.value = null;
@@ -181,7 +210,7 @@ async function saveNetwork() {
         <div>
           <Button label="Test connection" icon="pi pi-bolt" fluid
                   severity="secondary" :loading="testing"
-                  :disabled="!form.sta_ssid || !canTestNow"
+                  :disabled="!form.sta_ssid || testing"
                   @click="testCredentials" />
         </div>
       </div>
@@ -215,9 +244,9 @@ async function saveNetwork() {
       Checking device status…
     </Message>
     <Message v-else-if="staInPlay && apIsUp === false" severity="info" :closable="false">
-      Connected to a network, so a live test isn't available here. Saving
-      applies the new details when the device reconnects — if they're wrong,
-      the recovery hotspot comes up so you can fix them.
+      Testing here briefly disconnects the device — it reconnects to the current
+      network on its own and shows the result. Saving isn't gated on it: the new
+      details apply on reconnect, with the recovery hotspot as the safety net.
     </Message>
 
     <!-- ============================================================

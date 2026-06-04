@@ -380,6 +380,15 @@ bool app_config_is_configured(void)
     return v;
 }
 
+temp_unit_t app_config_get_dashboard_unit(void)
+{
+    temp_unit_t v;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    v = s_cfg.dashboard_unit;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 void app_config_get_device_name(char *buf, size_t len)
 {
     if (!buf || len == 0) return;

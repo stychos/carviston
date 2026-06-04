@@ -366,9 +366,8 @@ function factoryReset() {
       <div class="tile">
         <h3>Update</h3>
         <p class="muted" style="margin: 0 0 10px 0; font-size: 13px;">
-          Upload a firmware <code>.bin</code>. The dashboard is bundled into
-          the firmware, so one image updates everything — the device verifies
-          it and reboots automatically.
+          Upload a firmware <code>.bin</code> — it updates the dashboard too.
+          The device verifies it and reboots automatically.
         </p>
         <FileUpload mode="basic" accept=".bin" :auto="true" customUpload
                     chooseLabel="Choose .bin" chooseIcon="pi pi-upload"

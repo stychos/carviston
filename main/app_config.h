@@ -153,6 +153,7 @@ bool           app_config_is_configured(void);
 void           app_config_get_device_name(char *buf, size_t len);
 void           app_config_get_hostname(char *buf, size_t len);
 bool           app_config_dashboard_locked(void);
+temp_unit_t    app_config_get_dashboard_unit(void);
 
 /* Returns "carviston-xxxxxx" using last 3 bytes of base MAC.
  * Caller-supplied buf, must be at least 20 bytes. */

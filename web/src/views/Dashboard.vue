@@ -12,6 +12,7 @@ import { authStatus, login, logout } from '../composables/auth.js';
 import { connectLive } from '../composables/liveState.js';
 import ConfigModal from '../components/ConfigModal.vue';
 import { safetyLabel, safetyDescription } from '../composables/safety.js';
+import { unitSuffix, pickTemp, fmtTemp, stepLabel } from '../composables/units.js';
 
 const toast = useToast();
 const configOpen = ref(false);
@@ -132,15 +133,18 @@ const safety_class = computed(() => {
 });
 
 const water = computed(() => {
-  const w = state.value?.water_c;
+  const w = pickTemp(state.value, 'water');
   if (w == null) return '—';
   return w.toFixed(1);
+});
+const targetDisplay = computed(() => {
+  const t = pickTemp(state.value, 'target');
+  return t == null ? '—' : Math.round(t);
 });
 
 /* Self-defensive temperature formatter: a faulted tank serializes its NTCs as
  * null (cJSON renders NaN as null), so don't trust the fault flag to gate the
  * .toFixed — guard on the value itself. */
-const fmtC = (v) => (v == null ? '—' : `${v.toFixed(1)}°C`);
 
 const anyHeater = computed(() => state.value?.heater_active?.some(Boolean));
 
@@ -266,7 +270,7 @@ async function clearSafety() {
 <template>
   <div class="shell">
     <div class="app-header">
-      <div class="app-title"><span class="brand-mark"></span>{{ deviceName }}</div>
+      <div class="app-title">{{ deviceName }}</div>
       <div class="row">
         <span class="pill" :class="online ? (connected ? 'good' : 'warn') : 'bad'">
           <span class="dot"></span>{{ online ? (connected ? 'live' : 'polling') : 'offline' }}
@@ -290,8 +294,8 @@ async function clearSafety() {
                     :cx="targetDot.x" :cy="targetDot.y" />
           </svg>
           <div class="gauge-center">
-            <div class="gauge-temp">{{ water }}<span class="gauge-unit">°C</span></div>
-            <div class="gauge-sub">target {{ state?.target_c ?? '—' }}°</div>
+            <div class="gauge-temp">{{ water }}<span class="gauge-unit">{{ unitSuffix }}</span></div>
+            <div class="gauge-sub">target {{ targetDisplay }}°</div>
           </div>
         </div>
 
@@ -317,7 +321,7 @@ async function clearSafety() {
                  :title="p.fault ? 'sensor mismatch / fault' : ''">
               <span class="dot" :class="p.fault ? 'bad' : 'good'"></span>
               <span class="tank-name">{{ ['Inlet', 'Outlet'][i] || `Tank ${i + 1}` }}</span>
-              <span class="tank-temps">{{ fmtC(p.regulation_c) }} / {{ fmtC(p.safety_c) }}</span>
+              <span class="tank-temps">{{ fmtTemp(p, 'regulation') }} / {{ fmtTemp(p, 'safety') }}</span>
               <span class="tank-state" :class="'state-' + tankState(i)">{{ tankState(i) }}</span>
             </div>
           </div>
@@ -331,7 +335,7 @@ async function clearSafety() {
                   class="temp-step" :class="{ active: state?.target_c === t }"
                   :disabled="!state?.master_enabled"
                   @click="setTarget(t)">
-            {{ t }}°
+            {{ stepLabel(t) }}°
           </button>
         </div>
 
