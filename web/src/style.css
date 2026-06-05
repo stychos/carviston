@@ -68,12 +68,7 @@ html, body, #app {
  * usable width — and the centring — stay constant whether or not the bar shows.
  * `overflow-x: clip` additionally stops any stray wide overlay from adding a
  * horizontal scrollbar (pins width to the viewport, no scroll container). */
-/* `overflow-y: scroll` ALWAYS reserves the vertical scrollbar track, so the
- * usable width never changes between a short page (boot splash / a state with
- * no scroll) and a tall one (a state that scrolls). `scrollbar-gutter: stable`
- * does the same on modern browsers, but isn't honored everywhere (older Safari)
- * — keeping both makes the column width rock-steady on load and across states. */
-html { scrollbar-gutter: stable; overflow-y: scroll; }
+html { scrollbar-gutter: stable; }
 html, body { overflow-x: clip; }
 body { overscroll-behavior: none; }
 
@@ -94,7 +89,12 @@ body { overscroll-behavior: none; }
 }
 
 .shell {
-  max-width: 720px; margin: 0 auto; padding: 24px 16px 64px;
+  /* `width: 100%` is load-bearing: as a flex item with `margin: 0 auto` in the
+   * app-root column, without it the shell shrinks to its content width (so it
+   * collapses narrower than 720px when content is short, and never lines up with
+   * the footer, which DOES set width:100%). With it the column is always 720px,
+   * matching .app-footer-inner. */
+  width: 100%; max-width: 720px; margin: 0 auto; padding: 24px 16px 64px;
 }
 
 .app-header {

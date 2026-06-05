@@ -1,6 +1,7 @@
 /* Carviston firmware entry point. */
 
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 
 #include "app_config.h"
@@ -57,6 +58,14 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_mgr_init());
     ESP_ERROR_CHECK(wifi_mgr_start());
     ESP_ERROR_CHECK(web_server_start());
+
+    /* Confirm the running image to the bootloader. If this unit still carries a
+     * rollback-enabled bootloader from an earlier build (the bootloader is only
+     * replaced by a serial flash, never by OTA), an OTA'd image that never marks
+     * itself valid is reverted to the previous slot on the next reboot — which
+     * looks like "the update didn't take". Calling this unconditionally makes an
+     * OTA stick; it's a harmless no-op on a bootloader without rollback. */
+    esp_ota_mark_app_valid_cancel_rollback();
 
     ESP_LOGI(TAG, "subsystems up; web server running on :80");
 }
