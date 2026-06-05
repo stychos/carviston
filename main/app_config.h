@@ -137,9 +137,8 @@ esp_err_t app_config_save(const app_config_t *in);
 
 /* Same as app_config_save() for the in-memory effect, but the NVS commit
  * is deferred to a low-priority worker task. Multiple rapid calls coalesce
- * into a single flash write after a short idle window, which is what the
- * Matter chip thread needs when a controller streams attribute updates
- * (slider drags, mode flicks). */
+ * into a single flash write after a short idle window, which is what rapid
+ * UI updates need when a slider is dragged (rapid setpoint changes). */
 esp_err_t app_config_save_deferred(const app_config_t *in);
 
 /* Wipe NVS + restore defaults. Used by "Hardware Reset" in maintenance tab. */

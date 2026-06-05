@@ -313,7 +313,7 @@ esp_err_t temperature_read(temperature_reading_t *out)
     }
 
     /* water_c = MEAN of the healthy tanks: the whole-heater temperature shown
-     * on the gauge, the LED bar and Matter. outlet_c is the outlet tank alone,
+     * on the gauge and the LED bar. outlet_c is the outlet tank alone,
      * used only for shower-ready. max_c (hottest tank) drives over-temp. */
     out->water_c   = healthy ? (sum_c / (float)healthy) : NAN;
     out->outlet_c  = out->tank[TANK_OUTLET].fault ? NAN

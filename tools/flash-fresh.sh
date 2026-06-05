@@ -3,7 +3,6 @@
 # as if it had never been configured. After this, the firmware will:
 #   - find configured=false in app_config → first-boot Setup flow
 #   - have no stored Wi-Fi station info (default `nvs` is empty)
-#   - have no Matter commissioning state (`matter_fac` is empty)
 #
 # Usage:
 #   ./tools/flash-fresh.sh                       # auto-detect port
@@ -27,5 +26,4 @@ cd "$(dirname "$0")/.."
 idf.py "$@" \
     erase-partition --partition-name storage \
     erase-partition --partition-name nvs \
-    erase-partition --partition-name matter_fac \
     flash

@@ -3,8 +3,8 @@
  * Owns the 1 Hz control loop: reads temperature, evaluates safety, processes
  * button events, runs the mode state machine, and commands relays.
  *
- * All public mutators are safe to call from any task (web server, button task,
- * future Matter handler). Internally they push a request that the next tick
+ * All public mutators are safe to call from any task (web server, button
+ * task). Internally they push a request that the next tick
  * picks up.
  */
 
@@ -64,9 +64,9 @@ void heater_toggle_element(uint8_t channel);
 void heater_clear_safety_fault(void);
 
 /* Atomically replace the current heating mode and return the previous value,
- * all under a single acquisition of the internal state lock. The Matter
- * boost path uses this to capture the pre-boost mode without races against
- * a concurrent button-press or web-API mode change. `prev_out` may be NULL.
+ * all under a single acquisition of the internal state lock. Lets a caller
+ * capture a prior mode without races against a concurrent button-press or
+ * web-API mode change. `prev_out` may be NULL.
  *
  * Side effects (NVS commit, event log emit, benchmark notify) happen outside
  * the lock, exactly as in heater_set_mode. */

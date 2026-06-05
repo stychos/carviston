@@ -65,9 +65,9 @@ void heater_set_target(uint8_t celsius)
     app_config_get(&cfg);
     if (cfg.target_temp_c != chosen) {
         cfg.target_temp_c = chosen;
-        /* Deferred — Matter chip thread calls this on every setpoint change
-         * a controller pushes; an inline nvs_commit would stall BLE adv and
-         * TCP keepalives during a sector erase. */
+        /* Deferred — rapid setpoint changes (e.g. dragging the web UI slider)
+         * would each trigger an inline nvs_commit and stall TCP keepalives
+         * during a sector erase. */
         app_config_save_deferred(&cfg);
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -113,9 +113,8 @@ void heater_atomic_swap_mode(heating_mode_t new_mode, heating_mode_t *prev_out)
     if (prev_out) *prev_out = prev;
 
     if (changed) {
-        /* Persist + telemetry outside the lock. Deferred save → the chip
-         * thread isn't stalled by a sector erase when a Matter controller
-         * cycles modes. */
+        /* Persist + telemetry outside the lock. Deferred save → rapid mode
+         * cycling isn't stalled by a sector erase. */
         app_config_t cfg;
         app_config_get(&cfg);
         if (cfg.heating_mode != new_mode) {
@@ -387,22 +386,6 @@ static uint8_t next_temp_down(uint8_t cur)
 }
 
 #include "wifi_mgr.h"     /* wifi_mgr_force_ap_mode */
-#include "matter_node.h" /* matter_node_open_pairing / pairing info */
-
-/* Combo: holding POWER + ECO together for COMBO_TRIGGER_MS opens a Matter
- * commissioning window. Both press orderings are supported — see the BTN
- * handlers and the tick-loop combo detector for the precise rules. */
-#define COMBO_TRIGGER_MS          3000
-#define COMBO_PAIR_WINDOW_S        180
-#define COMBO_PRESS_PROXIMITY_US  (500 * 1000)   /* 500 ms — power+eco "near-simultaneous" */
-#define COMBO_PRESS_RECENT_US     (2000 * 1000)  /* 2 s — power pressed recently enough that
-                                                    a subsequent ECO long-press still belongs
-                                                    to the combo */
-
-/* Press / toggle timestamps used by the combo logic. Updated only from the
- * heater control task, so no lock required. */
-static int64_t s_last_power_press_us = 0;
-static int64_t s_master_toggle_us    = 0;
 
 static void process_button(const button_event_t *ev)
 {
@@ -415,36 +398,13 @@ static void process_button(const button_event_t *ev)
     switch (id) {
     case BTN_POWER:
         if (k == BTN_KIND_PRESS) {
-            int64_t now = esp_timer_get_time();
-            s_last_power_press_us = now;
-            /* If ECO is already down, the user is starting (or completing)
-             * the Matter pairing combo — don't fire the standalone master
-             * toggle. The reverse ordering (POWER first, then ECO) is
-             * handled by the retroactive undo in the tick-loop fire path. */
-            if (buttons_is_held(BTN_ECO)) {
-                ESP_LOGI(TAG, "BTN power press while ECO held — combo, suppress toggle");
-                break;
-            }
             heater_toggle_master();
-            s_master_toggle_us = now;
             ESP_LOGI(TAG, "BTN power → master=%d", (int)s_state.master_enabled);
         }
         break;
 
     case BTN_ECO:
         if (k == BTN_KIND_LONG) {
-            int64_t now = esp_timer_get_time();
-            /* Suppress AP-mode if POWER is held right now OR was pressed
-             * recently — covers both orderings of the Matter pairing combo:
-             *   - POWER held already (caught by buttons_is_held)
-             *   - POWER pressed within the last COMBO_PRESS_RECENT_US,
-             *     even if briefly released or not yet held when LONG fires. */
-            if (buttons_is_held(BTN_POWER) ||
-                (s_last_power_press_us != 0 &&
-                 now - s_last_power_press_us < COMBO_PRESS_RECENT_US)) {
-                ESP_LOGI(TAG, "BTN eco long-press ignored (combo in progress)");
-                break;
-            }
             ESP_LOGI(TAG, "BTN eco long-press → force AP mode");
             leds_animate_ap_mode();
             wifi_mgr_force_ap_mode();
@@ -495,12 +455,6 @@ static void control_task(void *arg)
     QueueHandle_t btn_q = buttons_event_queue();
     led_panel_state_t led;
 
-    /* Tracks the time at which BOTH POWER+ECO first went down together.
-     * 0 = not currently held. Sub-tick precision via esp_timer so the trigger
-     * lands within ~one buttons-poll period (20 ms) of COMBO_TRIGGER_MS,
-     * rather than jittering across a 1 s window. */
-    static int64_t combo_both_held_since_us = 0;
-    static bool    combo_fired              = false;
     int64_t next_control_us = 0;
 
     for (;;) {
@@ -510,49 +464,7 @@ static void control_task(void *arg)
             process_button(&ev);
         }
 
-        /* POWER + ECO held → Matter commissioning combo */
-        bool combo_held = buttons_is_held(BTN_POWER) && buttons_is_held(BTN_ECO);
-        if (combo_held) {
-            if (combo_both_held_since_us == 0) {
-                combo_both_held_since_us = esp_timer_get_time();
-            }
-            int64_t held_ms = (esp_timer_get_time() - combo_both_held_since_us) / 1000;
-            if (!combo_fired && held_ms >= COMBO_TRIGGER_MS) {
-                combo_fired = true;
-                ESP_LOGI(TAG, "POWER+ECO held %lld ms → open Matter pairing window",
-                         (long long)held_ms);
-
-                /* If POWER PRESS toggled master right around when ECO joined
-                 * (POWER-first ordering, the toggle fired before ECO had
-                 * arrived), retroactively undo it — the user's intent was
-                 * the combo, not a power toggle. */
-                if (s_master_toggle_us != 0 &&
-                    s_master_toggle_us >= combo_both_held_since_us - COMBO_PRESS_PROXIMITY_US) {
-                    ESP_LOGI(TAG, "combo undoing the POWER PRESS toggle that started it");
-                    heater_toggle_master();
-                    s_master_toggle_us = 0;
-                }
-
-                if (matter_node_open_pairing(COMBO_PAIR_WINDOW_S) == ESP_OK) {
-                    leds_set_matter_pairing(true);
-                    event_log_emit(EV_BUTTON_LONG, 99 /* combo */, 0, NULL);
-                }
-            }
-        } else {
-            combo_both_held_since_us = 0;
-            combo_fired              = false;
-        }
-
-        /* Keep the SHOWER LED's commissioning blink in sync with the actual
-         * pairing window — it auto-clears when the window times out. */
-        {
-            matter_pairing_info_t pi;
-            if (matter_node_get_pairing_info(&pi) == ESP_OK) {
-                leds_set_matter_pairing(pi.active);
-            }
-        }
-
-        /* Buttons + combo + pairing (above) are serviced every INPUT_POLL_MS so
+        /* Buttons are serviced every INPUT_POLL_MS so
          * +/- and the panel stay responsive. The heavy control block below
          * (temperature read alone takes a few hundred ms) runs only once per
          * TICK_MS — draining buttons at that 1 Hz cadence is what made rapid
@@ -686,8 +598,8 @@ esp_err_t heater_control_init(void)
     s_state.mode           = cfg.heating_mode;
     s_state.phase_name     = "idle";
     /* Temperature reading is "unknown" until temperature.c produces one — NaN
-     * propagates correctly through Matter (nullable int16 → Matter null) and
-     * the LED panel, where 0 °C would incorrectly enable the 40 °C LED. */
+     * propagates correctly through the UI and the LED panel, where 0 °C would
+     * incorrectly enable the 40 °C LED. */
     s_state.temp.water_c                    = NAN;
     s_state.temp.outlet_c                   = NAN;
     s_state.temp.max_c                      = NAN;

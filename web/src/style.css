@@ -311,19 +311,6 @@ body { overscroll-behavior: none; }
 .sys-icon-cell.sys-warn .signal-bars .bar.on { background: var(--warn); }
 .sys-icon-cell.sys-bad  .signal-bars .bar.on { background: var(--bad);  }
 
-.matter-manual {
-  font: 600 22px/1.2 ui-monospace, "SF Mono", Menlo, monospace;
-  letter-spacing: 1.5px;
-  padding: 6px 12px; border-radius: 8px;
-  background: var(--surface-2); color: var(--text);
-}
-.matter-qr {
-  font: 12px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
-  word-break: break-all; flex: 1;
-  padding: 6px 10px; border-radius: 8px;
-  background: var(--surface-2); color: var(--text);
-}
-
 /* --- PrimeVue dark-theme overrides ----------------------------------------
  * Aura preset's dialog + tabs ship with light surfaces and a light border
  * that read as "white" on our dark theme. These selectors flatten all of

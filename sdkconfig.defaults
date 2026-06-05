@@ -39,25 +39,3 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # Main task stack
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
-
-# --- Matter -----------------------------------------------------------------
-# Matter is ON by default. Requires the esp-matter SDK to be installed and
-# sourced alongside ESP-IDF — see docs/MATTER.md. To strip Matter (and BLE)
-# out for a smaller, local-only build, set CARVISTON_MATTER_ENABLE=n in
-# menuconfig and the dependent options below also become n.
-CONFIG_CARVISTON_MATTER_ENABLE=y
-
-# BLE — used only during Matter commissioning. The "BLE only for
-# commissioning" flag releases BLE RAM after pairing completes so the
-# heater isn't paying for an idle BT stack the rest of its lifetime.
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_ENABLE_CHIPOBLE=y
-CONFIG_USE_BLE_ONLY_FOR_COMMISSIONING=y
-
-# Matter factory data partition — see partitions.csv (matter_fac, 64 KB).
-CONFIG_FACTORY_PARTITION_NAME="matter_fac"
-
-# Let the espressif/mdns component handle mDNS — chip's built-in minimal
-# mDNS conflicts with the carviston.local advertisement from wifi_mgr.c.
-CONFIG_USE_MINIMAL_MDNS=n

@@ -1,14 +1,3 @@
-# matter_node.cpp collapses to a stub unless CONFIG_CARVISTON_MATTER_ENABLE=y.
-# When enabled it includes <esp_matter.h>, so the esp_matter component (which
-# transitively brings the chip stack) must be on this component's requirements.
-# esp_matter itself reaches the build via EXTRA_COMPONENT_DIRS, exported by
-# `source $ESP_MATTER_PATH/export.sh` (see docs/MATTER.md). Guard the dependency
-# on the Kconfig flag so the local-only stub build needs neither installed.
-set(matter_reqs "")
-if(CONFIG_CARVISTON_MATTER_ENABLE)
-    list(APPEND matter_reqs esp_matter)
-endif()
-
 idf_component_register(
     SRCS
         "main.c"
@@ -24,7 +13,6 @@ idf_component_register(
         "web_assets.c"
         "web_server.c"
         "ota.c"
-        "matter_node.cpp"
         "event_log.c"
         "benchmark.c"
     INCLUDE_DIRS
@@ -41,7 +29,6 @@ idf_component_register(
         esp_driver_gpio
         esp_timer
         mbedtls
-        ${matter_reqs}
 )
 
 # --- Embedded web UI (replaces the old SPIFFS 'web' partition) --------------

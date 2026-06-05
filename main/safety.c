@@ -38,7 +38,7 @@ static const char *TAG = "safety";
 static SemaphoreHandle_t s_lock;
 static safety_status_t s_status = SAFETY_OK;
 /* Consecutive sensor-fault tick count for the debounce. Guarded by s_lock: the
- * heater task increments/resets it in safety_evaluate(), and a UI/Matter clear
+ * heater task increments/resets it in safety_evaluate(), and a UI clear
  * (safety_clear_fault) resets it from another task. */
 static uint8_t s_sensor_fault_streak = 0;
 /* Consecutive clear-condition ticks while a fault is latched — drives

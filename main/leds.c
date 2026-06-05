@@ -81,17 +81,6 @@ static ap_anim_t s_ap_anim;
 #define AP_ANIM_OFF_MS       120
 #define AP_ANIM_BLINKS       6
 
-/* --- Matter commissioning indicator (SHOWER, double-blink heartbeat).
- * Continuous while a commissioning window is open. 1 s period: two short
- * on-pulses near the start, then dark. */
-static bool s_matter_pairing;
-
-#define MATTER_PERIOD_MS     1000
-#define MATTER_ON1_MS        150   /* 0 → 150       on  */
-#define MATTER_GAP_MS        100   /* 150 → 250     off */
-#define MATTER_ON2_MS        150   /* 250 → 400     on  */
-                                   /* 400 → 1000    off */
-
 esp_err_t leds_init(void);  /* forward */
 
 static inline void set(gpio_num_t pin, bool on) { gpio_set_level(pin, on ? 1 : 0); }
@@ -140,24 +129,6 @@ void leds_animate_ap_mode(void)
     s_ap_anim.start_us    = esp_timer_get_time();
     s_ap_anim.blink_count = AP_ANIM_BLINKS;
     xSemaphoreGive(s_lock);
-}
-
-void leds_set_matter_pairing(bool on)
-{
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_matter_pairing = on;
-    xSemaphoreGive(s_lock);
-}
-
-static bool eval_matter_pairing(uint64_t now_us, bool *led_on)
-{
-    if (!s_matter_pairing) return false;
-    uint32_t t = (uint32_t)((now_us / 1000ULL) % MATTER_PERIOD_MS);
-    if (t < MATTER_ON1_MS)                                  { *led_on = true;  return true; }
-    if (t < MATTER_ON1_MS + MATTER_GAP_MS)                  { *led_on = false; return true; }
-    if (t < MATTER_ON1_MS + MATTER_GAP_MS + MATTER_ON2_MS)  { *led_on = true;  return true; }
-    *led_on = false;
-    return true;
 }
 
 /* Render-time evaluators for the two animations.
@@ -269,11 +240,6 @@ static void render_once(void)
     if (eval_mode_anim(now_us, &anim_val)) {
         power_on  = anim_val;
         eco_on    = anim_val;
-        shower_on = anim_val;
-    }
-
-    /* --- Matter commissioning overrides SHOWER LED only ----------------- */
-    if (eval_matter_pairing(now_us, &anim_val)) {
         shower_on = anim_val;
     }
 

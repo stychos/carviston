@@ -10,7 +10,6 @@
 #include "event_log.h"
 #include "heater_control.h"
 #include "leds.h"
-#include "matter_node.h"
 #include "relays.h"
 #include "safety.h"
 #include "temperature.h"
@@ -58,7 +57,6 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_mgr_init());
     ESP_ERROR_CHECK(wifi_mgr_start());
     ESP_ERROR_CHECK(web_server_start());
-    ESP_ERROR_CHECK(matter_node_start());
 
     ESP_LOGI(TAG, "subsystems up; web server running on :80");
 }

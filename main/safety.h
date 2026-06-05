@@ -11,7 +11,7 @@
  * safety_evaluate() keeps re-checking the live inputs each tick, and once the
  * condition has read clear for a short recovery window the latch drops on its
  * own and heating resumes — no user action required. safety_clear_fault()
- * still exists for an explicit manual reset from the UI/Matter.
+ * still exists for an explicit manual reset from the UI.
  *
  * safety_evaluate() should be called periodically (e.g. once per heater_control
  * tick) with the latest temperature reading. It updates the cached state.
@@ -46,7 +46,7 @@ safety_status_t safety_status(void);
 /* True iff status == SAFETY_OK. Used by heater_control before energising. */
 bool safety_is_ok(void);
 
-/* Explicit manual reset (from UI/Matter). The fault re-latches on the next
+/* Explicit manual reset (from the UI). The fault re-latches on the next
  * evaluate if its condition still holds; normally the latch auto-recovers on
  * its own, so this is only for forcing an immediate clear. */
 void safety_clear_fault(void);

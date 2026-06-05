@@ -15,7 +15,7 @@
  *   - per-tank regulation & safety temperatures
  *   - per-tank fault flag (its two NTCs disagree, or one is open/short)
  *   - water_c: the MEAN of the healthy tanks — the single number shown on the
- *     UI gauge, the LED bar and Matter (the whole-heater temperature)
+ *     UI gauge and the LED bar (the whole-heater temperature)
  *   - outlet_c: the OUTLET tank's regulation NTC alone (delivered water) — used
  *     only for the shower-ready decision; NaN if the outlet sensor has faulted
  *   - max_c: the hottest healthy tank — what the soft over-temp limit watches
@@ -47,7 +47,7 @@ typedef struct {
 
 typedef struct {
     tank_reading_t tank[TANK_COUNT];
-    float water_c;         /* mean of healthy tanks — UI gauge / LEDs / Matter */
+    float water_c;         /* mean of healthy tanks — UI gauge / LEDs */
     float outlet_c;        /* outlet tank only — shower-ready (NaN if faulted) */
     float max_c;           /* hottest healthy tank — soft over-temp watches this */
     bool  any_fault;       /* any tank faulted */

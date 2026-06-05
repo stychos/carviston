@@ -827,51 +827,6 @@ static esp_err_t api_benchmarks_clear(httpd_req_t *req)
     return send_json(req, o, 200);
 }
 
-/* ---------- Matter commissioning ---------- */
-#include "matter_node.h"
-
-static esp_err_t api_matter_code(httpd_req_t *req)
-{
-    if (!require_auth(req)) return ESP_OK;
-    matter_pairing_info_t pi;
-    matter_node_get_pairing_info(&pi);
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (o, "active",  pi.active);
-    cJSON_AddStringToObject(o, "qr",      pi.qr);
-    cJSON_AddStringToObject(o, "manual",  pi.manual);
-    cJSON_AddNumberToObject(o, "window_s_remaining", pi.window_s_remaining);
-    return send_json(req, o, 200);
-}
-
-static esp_err_t api_matter_open(httpd_req_t *req)
-{
-    if (!require_auth(req)) return ESP_OK;
-    /* Body is optional JSON { "window_s": 180 }; default 180. Matter spec
-     * clamps the basic commissioning window to [180, 900] so we do the same
-     * here — and report the clamped value in the response so the UI's
-     * countdown matches what the chip stack actually enforces. */
-    double w_in = 180;
-    cJSON *j = read_json_body(req);
-    if (j) {
-        cJSON *w = cJSON_GetObjectItem(j, "window_s");
-        if (cJSON_IsNumber(w)) w_in = w->valuedouble;
-        cJSON_Delete(j);
-    }
-    if (!(w_in >= 180.0)) w_in = 180.0;   /* catches NaN too */
-    if (w_in > 900.0)    w_in = 900.0;
-    uint32_t window_s = (uint32_t)w_in;
-
-    esp_err_t err = matter_node_open_pairing(window_s);
-    if (err == ESP_ERR_NOT_SUPPORTED) {
-        /* Matter compiled out — let the client hide the UI cleanly. */
-        return send_error(req, 503, "matter disabled in this build");
-    }
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (o, "ok", err == ESP_OK);
-    cJSON_AddNumberToObject(o, "window_s", window_s);
-    return send_json(req, o, err == ESP_OK ? 200 : 500);
-}
-
 /* ---------- WebSocket live state ---------- */
 
 /* Add or replace a slot for this fd. If the slot is already used, refresh
@@ -1170,9 +1125,6 @@ esp_err_t web_server_start(void)
     ROUTE("/api/log", HTTP_GET, api_log);
     ROUTE("/api/log/clear",        HTTP_POST, api_log_clear);
     ROUTE("/api/benchmarks/clear", HTTP_POST, api_benchmarks_clear);
-
-    ROUTE("/api/matter/code", HTTP_GET,  api_matter_code);
-    ROUTE("/api/matter/open", HTTP_POST, api_matter_open);
 
     ROUTE("/api/ota", HTTP_POST, ota_upload_handler);
 

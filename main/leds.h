@@ -64,12 +64,6 @@ void leds_animate_mode(uint8_t mode_index);
 /* Quick distinctive animation when force-AP-mode fires. */
 void leds_animate_ap_mode(void);
 
-/* While Matter commissioning is open, override the SHOWER LED with a
- * fast double-blink (heartbeat-style) so the user sees the device is
- * advertising for pairing. Idempotent; pass `false` when the window
- * closes. */
-void leds_set_matter_pairing(bool on);
-
 #ifdef __cplusplus
 }
 #endif
