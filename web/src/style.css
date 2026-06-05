@@ -68,7 +68,12 @@ html, body, #app {
  * usable width — and the centring — stay constant whether or not the bar shows.
  * `overflow-x: clip` additionally stops any stray wide overlay from adding a
  * horizontal scrollbar (pins width to the viewport, no scroll container). */
-html { scrollbar-gutter: stable; }
+/* `overflow-y: scroll` ALWAYS reserves the vertical scrollbar track, so the
+ * usable width never changes between a short page (boot splash / a state with
+ * no scroll) and a tall one (a state that scrolls). `scrollbar-gutter: stable`
+ * does the same on modern browsers, but isn't honored everywhere (older Safari)
+ * — keeping both makes the column width rock-steady on load and across states. */
+html { scrollbar-gutter: stable; overflow-y: scroll; }
 html, body { overflow-x: clip; }
 body { overscroll-behavior: none; }
 
@@ -99,6 +104,10 @@ body { overscroll-behavior: none; }
 
 .app-title {
   display: flex; align-items: center; gap: 9px;
+  /* Nudge the title in by ~one icon-button radius so its left edge lines up
+   * optically with the centered glyphs of the round buttons on the right
+   * (which are inset from the header edge by their circular shape). */
+  padding-left: 16px;
   font-size: 20px; font-weight: 600; letter-spacing: 0.4px;
 }
 .muted { color: var(--muted); }
@@ -382,6 +391,11 @@ body { overscroll-behavior: none; }
 }
 .p-dialog {
   border: 1px solid var(--border) !important;
+  border-radius: 14px !important;
+  /* Clip the header/content/footer (each given its own square `background`
+   * above) to the rounded shape — without this their square corners poke out
+   * past the rounded border, so the dialog shows mixed rounded+square corners. */
+  overflow: hidden !important;
   box-shadow: var(--shadow-strong) !important;
 }
 .p-dialog-mask { background: var(--mask) !important; }
