@@ -22,6 +22,7 @@ extern "C" {
 #define APP_CFG_TOKEN_BYTES        32   /* session token raw bytes */
 #define APP_CFG_WIFI_SSID_MAX      33
 #define APP_CFG_WIFI_PASS_MAX      65
+#define APP_CFG_WIFI_COUNTRY_MAX   4    /* ISO-3166 alpha-2 + optional env char + NUL; "01" = world */
 #define APP_CFG_DEVICE_NAME_MAX    32   /* user-facing display name shown in the UI */
 #define APP_CFG_HOSTNAME_MAX       32   /* network hostname (DHCP + mDNS label); empty → "carviston" */
 
@@ -105,6 +106,7 @@ typedef struct {
     char  sta_pass[APP_CFG_WIFI_PASS_MAX];
     char  ap_ssid[APP_CFG_WIFI_SSID_MAX];   /* if empty, derived from MAC */
     char  ap_pass[APP_CFG_WIFI_PASS_MAX];   /* if empty, AP is open (first boot) */
+    char  wifi_country[APP_CFG_WIFI_COUNTRY_MAX]; /* regulatory domain: ISO code (e.g. "US","DE") or "01" world; empty → "US" */
     bool     sta_fallback_enabled;          /* in pure STA mode: bring up the recovery AP after sta_fallback_seconds without GOT_IP */
     uint16_t sta_fallback_seconds;          /* timeout (s) before the fallback AP comes up; default 60 */
 

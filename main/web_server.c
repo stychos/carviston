@@ -334,6 +334,7 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddNumberToObject(o, "eco_led_mode", c->eco_led_mode);
     cJSON_AddNumberToObject(o, "dashboard_unit", c->dashboard_unit);
     cJSON_AddNumberToObject(o, "wifi_mode", c->wifi_mode);
+    cJSON_AddStringToObject(o, "wifi_country", c->wifi_country[0] ? c->wifi_country : "US");
     cJSON_AddStringToObject(o, "sta_ssid", c->sta_ssid);
     cJSON_AddStringToObject(o, "ap_ssid", c->ap_ssid);
     cJSON_AddBoolToObject  (o, "sta_fallback_enabled", c->sta_fallback_enabled);
@@ -471,6 +472,22 @@ static esp_err_t api_config_put(httpd_req_t *req)
     v = cJSON_GetObjectItemCaseSensitive(body, "ap_pass");
     if (cJSON_IsString(v) && v->valuestring) strlcpy(cfg.ap_pass, v->valuestring, sizeof(cfg.ap_pass));
 
+    /* Regulatory domain. Normalise to upper-case alnum (ISO code like "US"/"DE"
+     * or the "01" world domain); an empty/garbage value leaves the field
+     * untouched. The radio re-applies it on the restart triggered below, and
+     * esp_wifi_set_country_code rejects any code its table doesn't know. */
+    v = cJSON_GetObjectItemCaseSensitive(body, "wifi_country");
+    if (cJSON_IsString(v) && v->valuestring) {
+        char cc[APP_CFG_WIFI_COUNTRY_MAX] = {0};
+        size_t n = 0;
+        for (const char *p = v->valuestring; *p && n + 1 < sizeof(cc); ++p) {
+            char ch = *p;
+            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) cc[n++] = ch;
+        }
+        if (n >= 2) strlcpy(cfg.wifi_country, cc, sizeof(cfg.wifi_country));
+    }
+
     cJSON_Delete(body);
     esp_err_t err = app_config_save(&cfg);
     if (err != ESP_OK) return send_error(req, 500, "save failed");
@@ -489,6 +506,7 @@ static esp_err_t api_config_put(httpd_req_t *req)
         || strcmp(before.sta_pass, cfg.sta_pass) != 0
         || strcmp(before.ap_ssid,  cfg.ap_ssid)  != 0
         || strcmp(before.ap_pass,  cfg.ap_pass)  != 0
+        || strcmp(before.wifi_country, cfg.wifi_country) != 0  /* re-apply regulatory domain */
         || strcmp(before.hostname, cfg.hostname) != 0;   /* re-register DHCP/mDNS name */
     if (wifi_changed) {
         /* Restart the radio AFTER the response has been flushed. Doing it

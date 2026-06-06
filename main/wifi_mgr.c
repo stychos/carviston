@@ -338,14 +338,6 @@ esp_err_t wifi_mgr_init(void)
     ESP_ERROR_CHECK(esp_wifi_init(&init));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
 
-    /* World regulatory domain + 802.11d. "01" scans/associates across channels
-     * 1-13 — the default table omits 12/13, so an EU router parked there would
-     * be invisible — and with 802.11d on we then adopt the connected AP's exact
-     * power limits from its beacons. Must run after init, before start. */
-    esp_err_t cerr = esp_wifi_set_country_code("01", true);
-    if (cerr != ESP_OK)
-        ESP_LOGW(TAG, "set_country_code failed: %s", esp_err_to_name(cerr));
-
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -452,10 +444,30 @@ static void apply_hostname(esp_netif_t *netif)
     mdns_hostname_set(hn);
 }
 
+/* Apply the configured regulatory domain with 802.11d OFF. The chosen country's
+ * table sets the legal channel set and TX-power ceiling that clamps
+ * apply_rf_profile()'s set_max_tx_power — e.g. "US" covers ch 1-11 at the full
+ * chip ceiling (no world-domain power clamp, so TX actually reaches 20 dBm) but
+ * omits ch 12/13; "01" is the conservative world domain. 802.11d disabled means
+ * a neighbour AP's beacon country IE can't drift us onto a different table.
+ * Re-applied on every start() so a region change in the UI takes effect on the
+ * radio restart. Must run after esp_wifi_init(), before esp_wifi_start(). */
+static void apply_country_code(const app_config_t *cfg)
+{
+    const char *cc = (cfg->wifi_country[0]) ? cfg->wifi_country : "US";
+    esp_err_t err = esp_wifi_set_country_code(cc, false);
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "set_country_code(%s) failed: %s", cc, esp_err_to_name(err));
+    else
+        ESP_LOGI(TAG, "regulatory domain: %s", cc);
+}
+
 esp_err_t wifi_mgr_start(void)
 {
     app_config_t cfg;
     app_config_get(&cfg);
+
+    apply_country_code(&cfg);
 
     wifi_role_t mode = cfg.wifi_mode;
     if (!cfg.configured) {

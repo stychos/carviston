@@ -17,7 +17,7 @@ static const char *TAG = "app_config";
 #define CFG_NVS_NS        "carviston"
 #define CFG_NVS_BLOB_KEY  "cfg"
 
-#define CFG_VERSION       8   /* v8: added `hostname` (DHCP + mDNS network name) */
+#define CFG_VERSION       9   /* v9: added `wifi_country` (regulatory domain) */
 
 /* Coalescing window for deferred saves — after a save is signalled we wait
  * this long for further changes to land before committing. Tunes the
@@ -68,6 +68,7 @@ static void apply_defaults(app_config_t *c)
     c->eco_led_mode         = ECO_LED_WIFI_STATE;
     c->dashboard_unit       = TEMP_UNIT_CELSIUS;
     c->wifi_mode            = WIFI_ROLE_AP;
+    strlcpy(c->wifi_country, "US", sizeof(c->wifi_country));
     c->sta_fallback_enabled = true;
     c->sta_fallback_seconds = 60;
     c->long_press_ms        = 1500;
