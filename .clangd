@@ -2,6 +2,10 @@
 # These flags only matter when cross-compiling with idf.py, not for indexing.
 
 CompileFlags:
+  # build/gen holds the generated app_version.h (CARVISTON_VERSION); it exists
+  # after the first `idf.py build`. Add it so the editor resolves the include.
+  Add:
+    - -Ibuild/gen
   Remove:
     - -mlongcalls
     - -mdisable-hardware-atomics

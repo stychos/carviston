@@ -1,19 +1,21 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-// App version string: 0.<config-schema>.<build>.
-//  - config-schema is the firmware's CFG_VERSION, the single source of truth in
-//    main/app_config.c (CLAUDE.md requires bumping it on every config change).
-//    We read it here rather than duplicate it, so the footer can never drift
-//    from the actual on-device schema.
-//  - build is a monotonic counter in an untracked file next to this config,
-//    incremented once per PRODUCTION build (vite build) — not on dev serve — so
-//    every flashed/OTA'd image carries a unique, increasing identifier.
-function appVersion(isBuild) {
-  const here = (p) => fileURLToPath(new URL(p, import.meta.url));
+// App version string: 0.<config-schema>.<build>. The single source of truth is
+// tools/gen-version.mjs, run by CMake at build time; it increments the counter
+// and hands us the result via the APP_VERSION env var (set by web/build.sh from
+// the generated app_version.txt), so the footer and the firmware always report
+// the identical string.
+//
+// On `vite dev` (no CMake, no env) we fall back to computing the string
+// read-only — same rules, but WITHOUT incrementing the counter, so dev serves
+// don't burn build numbers.
+function appVersion() {
+  if (process.env.APP_VERSION) return process.env.APP_VERSION;
 
+  const here = (p) => fileURLToPath(new URL(p, import.meta.url));
   let cfg = '?';
   try {
     const m = readFileSync(here('../main/app_config.c'), 'utf8')
@@ -21,21 +23,12 @@ function appVersion(isBuild) {
     if (m) cfg = m[1];
   } catch { /* leave '?' if the file moved — visible, not fatal */ }
 
-  // The counter file records the config version it was counting under ("<cfg>
-  // <build>") so build numbering restarts at 0 whenever CFG_VERSION bumps — a
-  // schema change is a new minor line, so 0.7.42 → 0.8.1, not 0.8.43. An old
-  // single-number file (no cfg recorded) is treated as a mismatch and resets.
-  const counter = here('./.build_version');
   let savedCfg = null, build = 0;
   try {
-    const parts = readFileSync(counter, 'utf8').trim().split(/\s+/);
+    const parts = readFileSync(here('./.build_version'), 'utf8').trim().split(/\s+/);
     if (parts.length >= 2) { savedCfg = parts[0]; build = parseInt(parts[1], 10) || 0; }
   } catch { /* first build */ }
-  if (savedCfg !== cfg) build = 0;   // config schema changed → restart build numbering
-  if (isBuild) {
-    build += 1;
-    try { writeFileSync(counter, `${cfg} ${build}\n`); } catch { /* read-only FS: still show prior */ }
-  }
+  if (savedCfg !== cfg) build = 0;
   return `0.${cfg}.${build}`;
 }
 
@@ -69,10 +62,10 @@ const trimPrimeicons = {
 export default defineConfig(({ command }) => ({
   plugins: [vue(), trimPrimeicons],
   // Baked into the bundle at build time → shown instantly in the footer with no
-  // runtime API call (works offline / on the boot screen). command==='build'
-  // gates the per-build counter increment so dev serve doesn't bump it.
+  // runtime API call (works offline / on the boot screen). The value comes from
+  // tools/gen-version.mjs via APP_VERSION (see appVersion()).
   define: {
-    __APP_VERSION__: JSON.stringify(appVersion(command === 'build')),
+    __APP_VERSION__: JSON.stringify(appVersion()),
   },
   build: {
     outDir: process.env.OUT_DIR || 'dist',

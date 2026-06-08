@@ -28,6 +28,8 @@
 #include "web_assets.h"
 #include "wifi_mgr.h"
 
+#include "app_version.h"   /* generated: CARVISTON_VERSION "0.<cfg>.<build>" */
+
 static const char *TAG = "web";
 
 static httpd_handle_t s_httpd;
@@ -190,6 +192,7 @@ static esp_err_t api_auth_status(httpd_req_t *req)
     cJSON_AddBoolToObject(o, "authenticated",   authed);
     cJSON_AddBoolToObject(o, "dashboard_locked", app_config_dashboard_locked());
     cJSON_AddStringToObject(o, "fw", running_fw_id());
+    cJSON_AddStringToObject(o, "fw_version", CARVISTON_VERSION);
     return send_json(req, o, 200);
 }
 
@@ -266,6 +269,7 @@ static cJSON *state_json(void)
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "device_name", devname);
+    cJSON_AddStringToObject(o, "fw_version", CARVISTON_VERSION);
     /* Device's own view of local wall-clock — lets the UI show the time the
      * scheduler actually reasons in (so a wrong timezone is obvious), and gate
      * the scheduler when the clock has never synced (AP mode / no NTP). */
