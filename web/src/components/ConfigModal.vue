@@ -18,6 +18,7 @@ import AppTab         from './tabs/AppTab.vue';
 import WifiTab        from './tabs/WifiTab.vue';
 import MaintenanceTab from './tabs/MaintenanceTab.vue';
 import LogsTab        from './tabs/LogsTab.vue';
+import SchedulerTab   from './tabs/SchedulerTab.vue';
 
 const props = defineProps({ visible: Boolean });
 const emit  = defineEmits(['update:visible']);
@@ -50,6 +51,7 @@ async function save(patch) {
           <Tab value="app">App</Tab>
           <Tab value="wifi">Wi-Fi</Tab>
           <Tab value="logs">Logs</Tab>
+          <Tab value="scheduler">Scheduler</Tab>
           <Tab value="maintenance">Maintenance</Tab>
         </TabList>
         <TabPanels>
@@ -62,6 +64,7 @@ async function save(patch) {
           <TabPanel value="app"><AppTab :cfg="cfg" :on-save="save" /></TabPanel>
           <TabPanel value="wifi"><WifiTab :cfg="cfg" :on-save="save" /></TabPanel>
           <TabPanel value="logs"><LogsTab /></TabPanel>
+          <TabPanel value="scheduler"><SchedulerTab :cfg="cfg" :on-save="save" /></TabPanel>
           <TabPanel value="maintenance"><MaintenanceTab /></TabPanel>
         </TabPanels>
       </Tabs>

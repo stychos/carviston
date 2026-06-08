@@ -294,18 +294,27 @@ esp_err_t temperature_read(temperature_reading_t *out)
     out->tank[TANK_OUTLET].regulation_c = t[2];
     out->tank[TANK_OUTLET].safety_c     = t[3];
 
-    /* Per-tank fault = the tank's two redundant NTCs disagree (or one is
-     * open/short → NaN). The tanks are NOT cross-checked against each other. */
+    /* Per-tank fault, two independent causes (tanks are NOT cross-checked):
+     *   - sensor bad : the two redundant NTCs disagree by more than THIS tank's
+     *                  window (inlet tolerates more — it stratifies on a draw),
+     *                  or one reads open/short (NaN).
+     *   - over-temp  : either NTC at/above the soft limit. The reading is
+     *                  trusted but the tank is too hot, so drop its element and
+     *                  let it auto-recover once it cools — the other tank keeps
+     *                  heating. Excluded from max_c so this stays a per-tank
+     *                  drop, not the global all-off that safety.c watches for. */
     int healthy = 0;
     float sum_c = 0.0f;
     float max_c = NAN;
     for (int k = 0; k < TANK_COUNT; ++k) {
         float r = out->tank[k].regulation_c;
         float s = out->tank[k].safety_c;
-        bool fault = isnan(r) || isnan(s) ||
-                     fabsf(r - s) > (float)cfg.probe_disagree_c;
-        out->tank[k].fault = fault;
-        if (!fault) {
+        bool sensor_bad = isnan(r) || isnan(s) ||
+                          fabsf(r - s) > (float)cfg.probe_disagree_c[k];
+        bool overtemp = (!isnan(r) && r >= TEMP_OVERTEMP_LIMIT_C) ||
+                        (!isnan(s) && s >= TEMP_OVERTEMP_LIMIT_C);
+        out->tank[k].fault = sensor_bad || overtemp;
+        if (!out->tank[k].fault) {
             healthy++;
             sum_c += r;
             max_c = isnan(max_c) ? r : fmaxf(max_c, r);

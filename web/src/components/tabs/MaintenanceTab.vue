@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue';
 import Button from 'primevue/button';
+import Checkbox from 'primevue/checkbox';
 import Dialog from 'primevue/dialog';
 import FileUpload from 'primevue/fileupload';
 import ProgressBar from 'primevue/progressbar';
@@ -35,6 +36,14 @@ const toast = useToast();
  *   'reloading'  — device responded again; about to window.location.replace
  *   'error'      — upload/reboot failed; user can close to retry
  */
+const otaUpload   = ref(null);               /* FileUpload instance, for clear() */
+const otaConfirm  = ref(false);              /* pre-flash confirm dialog visible */
+const otaFile     = ref(null);               /* the chosen .bin awaiting confirmation */
+const otaResetCfg = ref(false);              /* checkbox: reset settings on flash */
+const otaFileLabel = computed(() => {
+  const f = otaFile.value;
+  return f ? `${f.name} · ${(f.size / 1048576).toFixed(2)} MB` : '';
+});
 const otaDialog   = ref(false);
 const otaPhase    = ref('idle');
 const otaProgress = ref(0);
@@ -51,40 +60,35 @@ function fetchWithTimeout(url, ms) {
     .finally(() => clearTimeout(t));
 }
 
-/* Upper bound on how long we wait for the device to answer again. For a
- * web-bundle update we start polling while the device is still writing flash
- * (which can run well over a minute), so this needs generous headroom —
- * ~2.5 s per attempt. A plain reboot answers within the first few attempts. */
+/* Upper bound on poll iterations while waiting for the device to come back.
+ * We start polling while the device is still writing flash (which can run well
+ * over a minute), so this needs generous headroom — up to ~2.2 s per iteration
+ * (1.5 s fetch timeout + 0.7 s gap). A plain reboot returns within a few. */
 const REBOOT_POLL_MAX = 90;
 
-/* Read /api/auth/status, returning the parsed body (or null if the device
- * isn't answering yet / the body wasn't JSON). */
-async function fetchStatus(ms) {
-  const r = await fetchWithTimeout('/api/auth/status', ms);
-  if (!r.ok) return null;
-  return await r.json().catch(() => ({}));
-}
-
-/* Poll until the device answers again. When `expectFwChange` is a previous
- * firmware id, only count it as "back" once the running firmware id DIFFERS —
- * so an aborted OTA that leaves the OLD image responsive is reported as a
- * failure instead of a false success (the poll alone can't tell a freshly
- * flashed device from one that never actually updated). */
-async function waitForReboot(expectFwChange = null) {
-  await new Promise(r => setTimeout(r, 3500));
+/* Poll /api/auth/status until the device has gone offline and then come back —
+ * i.e. it actually rebooted. We don't look at firmware ids or boot counters,
+ * just reachability. The device runs a single-task HTTP server, so it answers
+ * nothing the whole time it's writing flash and rebooting; a GET that succeeds
+ * *after* we've seen it unreachable means it's up again on the new firmware.
+ *
+ * Requiring the offline→online transition (not merely "it answered") is what
+ * tells a real reboot apart from an upload that aborted with the old image
+ * still serving: there the device never drops offline, so we never see the
+ * transition, keep polling, and time out → reported as a failure. */
+async function waitForReboot() {
   rebootAttempt.value = 0;
+  let sawDown = false;
   for (let i = 0; i < REBOOT_POLL_MAX; i++) {
     rebootAttempt.value = i + 1;
+    let up = false;
     try {
-      const s = await fetchStatus(1500);
-      if (s) {
-        if (!expectFwChange) return true;          /* plain reboot: any answer = back */
-        if (s.fw && s.fw !== expectFwChange) return true;
-        /* Answered, but still the old firmware id — the new image isn't
-         * running. Keep polling; if it never changes we time out → error. */
-      }
-    } catch { /* device still down or fetch aborted */ }
-    await new Promise(r => setTimeout(r, 1000));
+      const r = await fetchWithTimeout('/api/auth/status', 1500);
+      up = r.ok;
+    } catch { up = false; /* device still down or fetch aborted */ }
+    if (!up)          sawDown = true;   /* offline — still writing / rebooting */
+    else if (sawDown) return true;      /* offline → online: it came back */
+    await new Promise(r => setTimeout(r, 700));
   }
   return false;
 }
@@ -175,8 +179,26 @@ function switchBoot() {
   });
 }
 
-async function uploadOta(event) {
+/* Picking a file no longer flashes immediately — flashing reboots the heater
+ * and is not freely reversible, so confirm intent first (and offer an opt-in
+ * config reset). On accept we hand the captured file to startUpload(); either
+ * way we clear the picker so the same file can be re-chosen after a cancel. */
+function uploadOta(event) {
   const file = event.files?.[0];
+  otaUpload.value?.clear?.();
+  if (!file) return;
+  otaFile.value     = file;
+  otaResetCfg.value = false;        /* default: keep current configuration */
+  otaConfirm.value  = true;
+}
+
+function confirmFlash() {
+  otaConfirm.value = false;
+  const file = otaFile.value;
+  if (file) startUpload(file, otaResetCfg.value);
+}
+
+async function startUpload(file, resetConfig) {
   if (!file) return;
   /* Modal opens immediately and locks the rest of the UI for the whole
    * upload→write→reboot→reload window. */
@@ -185,14 +207,6 @@ async function uploadOta(event) {
   otaPhase.value    = 'uploading';
   otaProgress.value = 0;
   otaError.value    = '';
-
-  /* Capture the running firmware id BEFORE the upload starts so the
-   * post-reboot poll can confirm the image actually changed. Awaited (not
-   * fire-and-forget) so a fast upload can't finish before we have it; the
-   * brief wait is invisible behind the 0 % progress bar. Best-effort: if it
-   * can't be read we fall back to the plain "device answered" check. */
-  let fwBefore = null;
-  try { fwBefore = (await fetchStatus(2000))?.fw ?? null; } catch { /* keep null */ }
 
   /* We upload a firmware image (the Vue UI is embedded inside it). Two facts
    * about the device drive everything below:
@@ -224,14 +238,15 @@ async function uploadOta(event) {
     if (waitStarted || superseded) return;
     waitStarted = true;
     if (otaPhase.value === 'uploading') otaPhase.value = 'writing';
-    /* Require the firmware id to actually change: a dropped connection at
-     * ~100 % aborts the flash and leaves the OLD image responsive, which the
-     * old "did it answer?" check reported as success. */
-    const came_back = await waitForReboot(fwBefore);
+    /* Wait for the device to drop offline (writing/rebooting) and come back. A
+     * dropped connection at ~100 % that aborts the flash leaves the OLD image
+     * serving without ever going offline, so the poll never sees the return and
+     * we time out → error, instead of falsely reporting success. */
+    const came_back = await waitForReboot();
     if (superseded) return;             /* a 4xx/5xx response already errored out */
     resolveReturn(came_back,
-      'The update did not take effect — the device is still running the previous '
-      + 'firmware (the upload may have been interrupted). Please try again.');
+      'The device did not come back online after the update — it may have been '
+      + 'interrupted. Refresh the page to check, or try again.');
   }
 
   function fail(msg) {
@@ -241,7 +256,7 @@ async function uploadOta(event) {
   }
 
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/ota');
+  xhr.open('POST', resetConfig ? '/api/ota?reset_config=1' : '/api/ota');
   xhr.setRequestHeader('Authorization', 'Bearer ' + token.value);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
 
@@ -366,11 +381,11 @@ function factoryReset() {
       <div class="tile">
         <h3>Update</h3>
         <p class="muted" style="margin: 0 0 10px 0; font-size: 13px;">
-          Upload a firmware <code>.bin</code> — it updates the dashboard too.
+          Upload a new firmware.
           The device verifies it and reboots automatically.
         </p>
-        <FileUpload mode="basic" accept=".bin" :auto="true" customUpload
-                    chooseLabel="Choose .bin" chooseIcon="pi pi-upload"
+        <FileUpload ref="otaUpload" mode="basic" accept=".bin" :auto="true" customUpload
+                    chooseLabel="Choose Firmware" chooseIcon="pi pi-upload"
                     :disabled="otaBusy" @select="uploadOta" />
       </div>
 
@@ -384,6 +399,36 @@ function factoryReset() {
                 severity="danger" @click="factoryReset" />
       </div>
     </div>
+
+    <!-- Pre-flash confirmation. Hosts the reset-settings opt-in, which a plain
+         confirm() can't, so it's a dedicated dialog. -->
+    <Dialog v-model:visible="otaConfirm" modal :draggable="false"
+            :style="{ width: '26rem' }" header="Flash firmware">
+      <div class="flash-confirm">
+        <p style="margin: 0 0 4px;">Flash this image now?</p>
+        <p class="muted firmware-name">{{ otaFileLabel }}</p>
+        <p class="muted" style="font-size: 13px; line-height: 1.45;">
+          The controller writes the new firmware and reboots — the heaters shut
+          off during the update. Keep this tab open until it finishes.
+        </p>
+        <label class="row reset-opt">
+          <Checkbox v-model="otaResetCfg" :binary="true" inputId="ota-reset" />
+          <span>
+            Reset all settings to defaults
+            <span class="muted" style="display: block; font-size: 12px;">
+              Wi-Fi and password are kept. Leave unchecked to preserve your
+              current configuration.
+            </span>
+          </span>
+        </label>
+      </div>
+      <template #footer>
+        <Button label="Cancel" text @click="otaConfirm = false" />
+        <Button :label="otaResetCfg ? 'Flash & reset settings' : 'Upload and flash'"
+                icon="pi pi-upload"
+                :severity="otaResetCfg ? 'danger' : 'primary'" @click="confirmFlash" />
+      </template>
+    </Dialog>
 
     <!-- Unified blocking modal for uploads + restarts. The modal cannot be
          dismissed except in the error phase so the user cannot click any
@@ -416,7 +461,14 @@ function factoryReset() {
           reboot on its own — this usually takes well under a minute. Please
           keep this tab open; the page reloads automatically once the device
           is back.
+          <template v-if="rebootAttempt > 0">
+            <br />Checking if it's back… attempt {{ rebootAttempt }} of {{ REBOOT_POLL_MAX }}.
+          </template>
         </div>
+        <Button v-if="rebootAttempt >= 5"
+                label="Reload now" icon="pi pi-refresh"
+                severity="secondary" size="small"
+                @click="manualReload" />
       </div>
 
       <!-- REBOOTING — device-side write + restart + waitForReboot poll -->
@@ -459,6 +511,14 @@ function factoryReset() {
   padding: 8px 4px 4px;
 }
 .reboot-label { font-size: 15px; font-weight: 500; }
+
+.flash-confirm { display: flex; flex-direction: column; gap: 6px; }
+.flash-confirm .firmware-name { font-weight: 600; word-break: break-all; margin: 0; }
+.reset-opt {
+  align-items: flex-start; gap: 10px; margin-top: 8px;
+  padding: 10px; border: 1px solid var(--border); border-radius: 8px;
+  cursor: pointer;
+}
 
 /* Pairs of cards (Reboot+Backup, Update+Factory reset) sit in two equal
  * columns; both stack on narrow screens. Items flex-column so the action

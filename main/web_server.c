@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "esp_http_server.h"
@@ -264,6 +265,19 @@ static cJSON *state_json(void)
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "device_name", devname);
+    /* Device's own view of local wall-clock — lets the UI show the time the
+     * scheduler actually reasons in (so a wrong timezone is obvious), and gate
+     * the scheduler when the clock has never synced (AP mode / no NTP). */
+    bool time_synced = wifi_mgr_time_synced();
+    cJSON_AddBoolToObject(o, "time_synced", time_synced);
+    if (time_synced) {
+        time_t now = time(NULL);
+        struct tm lt;
+        localtime_r(&now, &lt);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M:%S", &lt);
+        cJSON_AddStringToObject(o, "device_time", buf);
+    }
     /* The user's preferred display unit (0=C, 1=F); the client reads the
      * matching _c/_f fields. Telemetry stays dual-unit regardless. */
     cJSON_AddNumberToObject(o, "display_unit", app_config_get_dashboard_unit());
@@ -329,11 +343,13 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddNumberToObject(o, "hysteresis_c", c->hysteresis_c);
     cJSON_AddNumberToObject(o, "ntc_r25_ohm", c->ntc_r25_ohm);
     cJSON_AddNumberToObject(o, "ntc_beta", c->ntc_beta);
-    cJSON_AddNumberToObject(o, "probe_disagree_c", c->probe_disagree_c);
+    cJSON_AddNumberToObject(o, "probe_disagree_inlet_c",  c->probe_disagree_c[0]);
+    cJSON_AddNumberToObject(o, "probe_disagree_outlet_c", c->probe_disagree_c[1]);
     cJSON_AddNumberToObject(o, "power_led_mode", c->power_led_mode);
     cJSON_AddNumberToObject(o, "eco_led_mode", c->eco_led_mode);
     cJSON_AddNumberToObject(o, "dashboard_unit", c->dashboard_unit);
     cJSON_AddNumberToObject(o, "wifi_mode", c->wifi_mode);
+    cJSON_AddStringToObject(o, "timezone", c->posix_tz[0] ? c->posix_tz : "UTC0");
     cJSON_AddStringToObject(o, "wifi_country", c->wifi_country[0] ? c->wifi_country : "US");
     cJSON_AddStringToObject(o, "sta_ssid", c->sta_ssid);
     cJSON_AddStringToObject(o, "ap_ssid", c->ap_ssid);
@@ -343,6 +359,20 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddNumberToObject(o, "preview_release_ms", c->preview_release_ms);
     cJSON_AddNumberToObject(o, "bench_resume_threshold_s", c->bench_resume_threshold_s);
     cJSON_AddBoolToObject  (o, "restore_power_on_boot", c->restore_power_on_boot);
+
+    cJSON_AddBoolToObject(o, "sched_enabled", c->sched_enabled);
+    cJSON *sched = cJSON_AddArrayToObject(o, "schedule");
+    for (int i = 0; i < c->sched_count && i < APP_CFG_SCHED_MAX; ++i) {
+        const sched_entry_t *e = &c->schedule[i];
+        cJSON *je = cJSON_CreateObject();
+        cJSON_AddNumberToObject(je, "hour",    e->hour);
+        cJSON_AddNumberToObject(je, "minute",  e->minute);
+        cJSON_AddNumberToObject(je, "action",  e->action);
+        cJSON_AddNumberToObject(je, "days",    e->days);
+        cJSON_AddBoolToObject  (je, "enabled", e->enabled);
+        cJSON_AddItemToArray(sched, je);
+    }
+
     /* never serialise the AP/STA passwords back to client; just signal "set" */
     cJSON_AddBoolToObject(o, "sta_pass_set",    c->sta_pass[0] != '\0');
     cJSON_AddBoolToObject(o, "ap_pass_set",     c->ap_pass[0]  != '\0');
@@ -430,7 +460,8 @@ static esp_err_t api_config_put(httpd_req_t *req)
     UPDATE_NUM(hysteresis_c,       "hysteresis_c",     1, 10);
     UPDATE_NUM(ntc_r25_ohm,        "ntc_r25_ohm",      1000, 1000000);
     UPDATE_NUM(ntc_beta,           "ntc_beta",         2000, 5500);
-    UPDATE_NUM(probe_disagree_c,   "probe_disagree_c", 1, 20);
+    UPDATE_NUM(probe_disagree_c[0], "probe_disagree_inlet_c",  1, 30);
+    UPDATE_NUM(probe_disagree_c[1], "probe_disagree_outlet_c", 1, 20);
     UPDATE_NUM(power_led_mode,     "power_led_mode",   0, 1);
     UPDATE_NUM(eco_led_mode,       "eco_led_mode",     0, 1);
     UPDATE_NUM(dashboard_unit,     "dashboard_unit",   0, 1);
@@ -448,6 +479,41 @@ static esp_err_t api_config_put(httpd_req_t *req)
     v = cJSON_GetObjectItemCaseSensitive(body, "restore_power_on_boot");
     if (cJSON_IsBool(v)) cfg.restore_power_on_boot = cJSON_IsTrue(v);
 
+    v = cJSON_GetObjectItemCaseSensitive(body, "sched_enabled");
+    if (cJSON_IsBool(v)) cfg.sched_enabled = cJSON_IsTrue(v);
+
+    /* Schedule is replaced wholesale: the UI always PUTs the full list. Build
+     * into a scratch array so a malformed element can't leave a half-written
+     * schedule, then commit count + array together. Out-of-range times drop
+     * the offending entry rather than failing the whole save. */
+    v = cJSON_GetObjectItemCaseSensitive(body, "schedule");
+    if (cJSON_IsArray(v)) {
+        sched_entry_t tmp[APP_CFG_SCHED_MAX];
+        memset(tmp, 0, sizeof(tmp));
+        uint8_t n = 0;
+        const cJSON *e;
+        cJSON_ArrayForEach(e, v) {
+            if (n >= APP_CFG_SCHED_MAX) break;
+            if (!cJSON_IsObject(e)) continue;
+            const cJSON *jh = cJSON_GetObjectItemCaseSensitive(e, "hour");
+            const cJSON *jm = cJSON_GetObjectItemCaseSensitive(e, "minute");
+            const cJSON *ja = cJSON_GetObjectItemCaseSensitive(e, "action");
+            const cJSON *jd = cJSON_GetObjectItemCaseSensitive(e, "days");
+            const cJSON *jen = cJSON_GetObjectItemCaseSensitive(e, "enabled");
+            if (!cJSON_IsNumber(jh) || !cJSON_IsNumber(jm)) continue;
+            int hh = jh->valueint, mm = jm->valueint;
+            if (hh < 0 || hh > 23 || mm < 0 || mm > 59) continue;
+            tmp[n].hour    = (uint8_t)hh;
+            tmp[n].minute  = (uint8_t)mm;
+            tmp[n].action  = (cJSON_IsNumber(ja) && ja->valueint == 1) ? 1 : 0;
+            tmp[n].days    = cJSON_IsNumber(jd) ? (uint8_t)(jd->valueint & 0x7F) : 0x7F;
+            tmp[n].enabled = cJSON_IsBool(jen) ? cJSON_IsTrue(jen) : true;
+            n++;
+        }
+        memcpy(cfg.schedule, tmp, sizeof(cfg.schedule));
+        cfg.sched_count = n;
+    }
+
     v = cJSON_GetObjectItemCaseSensitive(body, "device_name");
     if (cJSON_IsString(v) && v->valuestring) {
         /* Trim leading/trailing spaces; an all-blank name stores empty so the
@@ -462,6 +528,10 @@ static esp_err_t api_config_put(httpd_req_t *req)
     v = cJSON_GetObjectItemCaseSensitive(body, "hostname");
     if (cJSON_IsString(v) && v->valuestring)
         sanitize_hostname(v->valuestring, cfg.hostname, sizeof(cfg.hostname));
+
+    v = cJSON_GetObjectItemCaseSensitive(body, "timezone");
+    if (cJSON_IsString(v) && v->valuestring && v->valuestring[0])
+        strlcpy(cfg.posix_tz, v->valuestring, sizeof(cfg.posix_tz));
 
     v = cJSON_GetObjectItemCaseSensitive(body, "sta_ssid");
     if (cJSON_IsString(v) && v->valuestring) strlcpy(cfg.sta_ssid, v->valuestring, sizeof(cfg.sta_ssid));
@@ -491,6 +561,10 @@ static esp_err_t api_config_put(httpd_req_t *req)
     cJSON_Delete(body);
     esp_err_t err = app_config_save(&cfg);
     if (err != ESP_OK) return send_error(req, 500, "save failed");
+
+    /* Re-apply the timezone immediately so the scheduler reasons in the new
+     * local time on the very next tick — no reboot needed. */
+    if (strcmp(before.posix_tz, cfg.posix_tz) != 0) app_config_apply_timezone();
 
     /* Route mode/target through the setters so heater_control resets its
      * mode_state and the event log records the change. Setters re-read the

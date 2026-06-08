@@ -10,12 +10,13 @@
 
 static const char *TAG = "safety";
 
-/* Soft over-temperature limit. With no hardware thermal cutoff, this firmware
- * limit is the SOLE over-temp protection. The highest user-settable target is
- * 80 °C, so 90 °C is a hard ceiling 10 °C above any legitimate setpoint — no
- * tank may exceed it under any condition. It is a real-time hazard: evaluated
- * independently of the (debounced) sensor faults and never debounced or masked. */
-#define SOFT_OVERTEMP_C   90.0f
+/* Soft over-temperature limit (shared constant, see temperature.h). Over-temp
+ * is now caught PER TANK in temperature_read() — a tank crossing the limit is
+ * flagged faulted, so heater_control drops just that element while the other
+ * tank keeps heating. That excludes it from max_c, so the global check below
+ * is a dormant defence-in-depth backstop: it only fires if an over-temp tank
+ * were ever to slip through as "healthy". Real-time, never debounced or masked. */
+#define SOFT_OVERTEMP_C   TEMP_OVERTEMP_LIMIT_C
 
 /* A total sensor loss (BOTH tanks faulted → no usable temperature anywhere)
  * must persist this many consecutive 1 Hz evaluations before it latches. The

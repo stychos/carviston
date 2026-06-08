@@ -29,6 +29,14 @@
 
 #include "esp_err.h"
 
+/* Soft over-temperature limit (°C). With no hardware thermal cutoff this is the
+ * sole over-temp protection, so it stays conservative — 10 °C above the highest
+ * user-settable target (80 °C). A tank with EITHER of its NTCs at/above this is
+ * flagged faulted (its element drops) until it cools back below, handled
+ * PER-TANK in temperature_read(); safety.c keeps a global drop-all as a dormant
+ * backstop. Shared by temperature.c and safety.c so there is one source. */
+#define TEMP_OVERTEMP_LIMIT_C  90.0f
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,7 +50,8 @@ typedef enum {
 typedef struct {
     float regulation_c;    /* control NTC — drives this tank's thermostat */
     float safety_c;        /* redundant NTC — cross-checked against regulation */
-    bool  fault;           /* the two NTCs disagree, or one is open/short */
+    bool  fault;           /* NTCs disagree, one is open/short, or the tank is
+                            * over TEMP_OVERTEMP_LIMIT_C — drop this element */
 } tank_reading_t;
 
 typedef struct {

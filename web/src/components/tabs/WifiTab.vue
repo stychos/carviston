@@ -22,8 +22,25 @@ const WIFI_MODES = [
   { v: 1, l: 'Connect to existing network' },
 ];
 
+/* Regulatory domain. Picks the legal channel set + TX-power ceiling. "US"
+ * gives full power on ch 1-11 (no ch 12/13); "01" is the conservative world
+ * domain that scans ch 1-13 but caps power lower. The codes are passed straight
+ * to esp_wifi_set_country_code, which rejects any it doesn't recognise. */
+const REGIONS = [
+  { v: '01', l: 'World (channels 1–13, lower power)' },
+  { v: 'US', l: 'United States / North America' },
+  { v: 'CA', l: 'Canada' },
+  { v: 'GB', l: 'United Kingdom' },
+  { v: 'DE', l: 'Europe (Germany)' },
+  { v: 'FR', l: 'Europe (France)' },
+  { v: 'AU', l: 'Australia' },
+  { v: 'JP', l: 'Japan' },
+  { v: 'CN', l: 'China' },
+];
+
 const form = reactive({
   wifi_mode: props.cfg.wifi_mode,
+  wifi_country: props.cfg.wifi_country || 'US',
   sta_ssid:  props.cfg.sta_ssid,
   sta_pass:  '',
   ap_ssid:   props.cfg.ap_ssid,
@@ -32,7 +49,8 @@ const form = reactive({
   sta_fallback_seconds: props.cfg.sta_fallback_seconds ?? 60,
 });
 watch(() => props.cfg, c => Object.assign(form, {
-  wifi_mode: c.wifi_mode, sta_ssid: c.sta_ssid, ap_ssid: c.ap_ssid,
+  wifi_mode: c.wifi_mode, wifi_country: c.wifi_country || 'US',
+  sta_ssid: c.sta_ssid, ap_ssid: c.ap_ssid,
   sta_fallback_enabled: c.sta_fallback_enabled ?? true,
   sta_fallback_seconds: c.sta_fallback_seconds ?? 60,
 }));
@@ -158,7 +176,7 @@ async function saveNetwork() {
                 life: 4000 });
     return;
   }
-  const patch = { wifi_mode: form.wifi_mode };
+  const patch = { wifi_mode: form.wifi_mode, wifi_country: form.wifi_country };
   if (staInPlay.value) {
     /* Persist exactly the credentials we just tested. */
     patch.sta_ssid = form.sta_ssid;
@@ -189,6 +207,17 @@ async function saveNetwork() {
       <label class="muted">Wi-Fi mode</label>
       <Select v-model="form.wifi_mode" :options="WIFI_MODES"
               optionLabel="l" optionValue="v" fluid />
+    </div>
+
+    <div>
+      <label class="muted">Region</label>
+      <Select v-model="form.wifi_country" :options="REGIONS"
+              optionLabel="l" optionValue="v" fluid />
+      <p class="muted" style="font-size: 12px; margin: 4px 0 0 0;">
+        Sets the legal Wi-Fi channels and transmit power. Pick the region the
+        device is in — a wrong region can hide your network or weaken the signal.
+        Changing it briefly restarts the radio.
+      </p>
     </div>
 
     <!-- ============================================================

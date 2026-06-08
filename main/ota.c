@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "app_config.h"
 #include "auth.h"
 #include "event_log.h"
 
@@ -85,7 +86,8 @@ static int recv_exact(httpd_req_t *req, void *dst, int want)
 
 /* --- firmware OTA path (ESP image magic 0xE9 at byte 0) ------------------- */
 static esp_err_t handle_firmware(httpd_req_t *req, int total,
-                                 const uint8_t *prefix, int prefix_len)
+                                 const uint8_t *prefix, int prefix_len,
+                                 bool reset_config)
 {
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) return reply(req, 500, "no ota partition");
@@ -152,6 +154,15 @@ static esp_err_t handle_firmware(httpd_req_t *req, int total,
 
     ESP_LOGI(TAG, "firmware OTA complete (%d bytes); rebooting", recvd);
     event_log_emit(EV_OTA_DONE, 0, 0, "fw");
+
+    /* Optional "reset settings" — drop the config blob now, AFTER the image is
+     * committed and set-boot succeeded, so a failed OTA never wipes config. The
+     * new firmware then boots on defaults (network + auth preserved). */
+    if (reset_config) {
+        app_config_erase_feature_blob();
+        event_log_emit(EV_OTA_DONE, 0, 0, "cfg_reset");
+    }
+
     event_log_flush();
     reply_and_reboot(req);
     return ESP_OK;
@@ -178,6 +189,16 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     int total = req->content_len;
     if (total <= 0) return reply(req, 400, "empty body");
 
+    /* ?reset_config=1 → wipe settings to defaults as part of this update. */
+    bool reset_config = false;
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "reset_config", val, sizeof(val)) == ESP_OK
+            && (val[0] == '1' || val[0] == 't' || val[0] == 'T'))
+            reset_config = true;
+    }
+
     /* Peek the 16-byte ESP image header (magic + chip_id) before touching any
      * flash, then re-stream those bytes as the start of the image. The web UI
      * now ships inside the firmware, so a firmware image is the only thing we
@@ -192,7 +213,7 @@ esp_err_t ota_upload_handler(httpd_req_t *req)
     }
 
     if (looks_like_firmware(prefix, prefix_len)) {
-        return handle_firmware(req, total, prefix, prefix_len);
+        return handle_firmware(req, total, prefix, prefix_len, reset_config);
     }
 
     ESP_LOGW(TAG, "rejected upload: header=%02x %02x %02x %02x ... (not an ESP32-S3 firmware image)",

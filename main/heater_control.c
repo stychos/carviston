@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -21,6 +22,14 @@
 static const char *TAG = "heater";
 
 #define TICK_MS  1000   /* heavy control cadence (read temp, evaluate, command) */
+
+/* Display-only smoothing of the whole-heater temperature (water_c). A draw
+ * dumps cold feed into the inlet tank, so the true mean lurches down for the
+ * length of the draw then recovers — jarring on the gauge/LED bar. A 1-pole
+ * low-pass (this time constant, in seconds) damps that transient while still
+ * tracking sustained heat-up/cool-down. Regulation, safety and benchmark all
+ * use the RAW reading; only the gauge/LED value is filtered. */
+#define DISPLAY_SMOOTH_TAU_S  30
 #define INPUT_POLL_MS  50   /* button/combo servicing cadence — keeps +/- snappy */
 
 static SemaphoreHandle_t s_lock;
@@ -226,15 +235,21 @@ void heater_get_state(heater_state_t *out)
 /* --- control logic --- */
 
 /* Returns true if a tank at `temp_c` should be in a "heating needed" cycle.
- * Implements hysteresis off the tank's own current relay state. */
+ * Implements hysteresis off the tank's own current relay state.
+ *
+ * The regulation band sits ABOVE the target: the target is the floor we never
+ * rest below, and the heater overshoots to target+hyst before coasting back
+ * down. So with the default 3 °C hysteresis the tank heats to target+3 and the
+ * rest interval cools to ~target — keeping delivered water at/above the
+ * setpoint and lengthening the rest between cycles. */
 static bool update_heating_phase(bool currently_heating, float temp_c,
                                  uint8_t target, uint8_t hyst)
 {
     if (isnan(temp_c)) return false;
     if (currently_heating) {
-        return temp_c < (float)target;
+        return temp_c < (float)target + (float)hyst;   /* heat up to target+hyst */
     }
-    return temp_c <= (float)target - (float)hyst;
+    return temp_c <= (float)target;                    /* resume at the target floor */
 }
 
 /* Each relay is bound to its own tank: relay/tank 0 = inlet, 1 = outlet.
@@ -449,6 +464,51 @@ static void process_button(const button_event_t *ev)
     }
 }
 
+/* Edge-triggered schedule evaluation, run once per control tick.
+ *
+ * Fires an entry exactly once when local wall-clock crosses its HH:MM on a
+ * matching weekday, calling heater_set_master_enabled() — the same path the
+ * POWER button uses, so manual override afterwards sticks until the next entry.
+ *
+ * Gated on SNTP: without a real clock we can't know the time, so the schedule
+ * is inert (s_sched_last_min stays disarmed). We track the last minute-of-day
+ * we acted on so each minute fires at most once, and on the first armed tick we
+ * adopt the current minute WITHOUT firing — that way booting (or re-enabling
+ * the schedule) inside an entry's minute doesn't replay an already-past action.
+ * The flip side, by design of edge-triggering: an entry whose minute elapses
+ * while the device is down or the clock unsynced is simply missed until its
+ * next occurrence.
+ *
+ * Must run WITHOUT s_lock held — heater_set_master_enabled takes it itself. */
+static int s_sched_last_min = -1;
+
+static void scheduler_tick(const app_config_t *cfg)
+{
+    if (!cfg->sched_enabled || cfg->sched_count == 0 || !wifi_mgr_time_synced()) {
+        s_sched_last_min = -1;   /* disarm: re-adopt the clock before next fire */
+        return;
+    }
+
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    int cur_min = lt.tm_hour * 60 + lt.tm_min;
+
+    if (s_sched_last_min < 0) { s_sched_last_min = cur_min; return; }  /* arm only */
+    if (cur_min == s_sched_last_min) return;                           /* same minute */
+    s_sched_last_min = cur_min;
+
+    uint8_t day_bit = (uint8_t)(1u << lt.tm_wday);   /* tm_wday: 0=Sun … 6=Sat */
+    for (int i = 0; i < cfg->sched_count && i < APP_CFG_SCHED_MAX; ++i) {
+        const sched_entry_t *e = &cfg->schedule[i];
+        if (!e->enabled || !(e->days & day_bit)) continue;
+        if (e->hour * 60 + e->minute != cur_min) continue;
+        ESP_LOGI(TAG, "schedule[%d] %02u:%02u → master %s",
+                 i, e->hour, e->minute, e->action ? "ON" : "OFF");
+        heater_set_master_enabled(e->action != 0);
+    }
+}
+
 static void control_task(void *arg)
 {
     (void)arg;
@@ -483,8 +543,31 @@ static void control_task(void *arg)
         temperature_read(&temp);
         safety_status_t safety = safety_evaluate(&temp);
 
+        /* Display-only EMA of the whole-heater temperature. Seeded from the
+         * first valid sample (no ramp-up from 0); reset to NaN on total sensor
+         * loss so recovery re-seeds rather than crawling back from a stale
+         * value. `temp.water_c` itself stays RAW for benchmark/safety below. */
+        static float s_display_water = NAN;
+        if (isnan(temp.water_c)) {
+            s_display_water = NAN;
+        } else if (isnan(s_display_water)) {
+            s_display_water = temp.water_c;
+        } else {
+            const float alpha = (float)TICK_MS /
+                                (float)(DISPLAY_SMOOTH_TAU_S * 1000 + TICK_MS);
+            s_display_water += alpha * (temp.water_c - s_display_water);
+        }
+
+        /* Apply any due scheduled on/off BEFORE we sample element state below,
+         * so a fired entry takes effect on this very tick. Runs without s_lock
+         * (heater_set_master_enabled takes it). */
+        scheduler_tick(&cfg);
+
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s_state.temp     = temp;
+        /* water_c is the UI/LED display number (per temperature.h): publish the
+         * smoothed value, not the raw mean. Per-tank rows below stay raw. */
+        s_state.temp.water_c = s_display_water;
         s_state.safety   = safety;
         s_state.target_c = cfg.target_temp_c;
         s_state.mode     = cfg.heating_mode;
@@ -565,7 +648,7 @@ static void control_task(void *arg)
 
         /* publish panel state to leds (the LED task renders at 10 Hz) */
         led.master_enabled    = s_state.master_enabled;
-        led.current_temp_c    = temp.water_c;
+        led.current_temp_c    = s_display_water;
         led.any_heater_active = relays_cmd[0] || relays_cmd[1];
         led.one_heater_active = relays_cmd[0] ^ relays_cmd[1];
         led.wifi_connected    = wifi_mgr_state() == WIFI_STATE_STA_CONNECTED;

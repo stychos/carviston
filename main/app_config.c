@@ -1,6 +1,8 @@
 #include "app_config.h"
 
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -17,7 +19,17 @@ static const char *TAG = "app_config";
 #define CFG_NVS_NS        "carviston"
 #define CFG_NVS_BLOB_KEY  "cfg"
 
-#define CFG_VERSION       9   /* v9: added `wifi_country` (regulatory domain) */
+/* CFG_VERSION is the current schema generation, written into every blob and
+ * bumped on EVERY schema change. CFG_LAYOUT_BASE is the oldest version whose
+ * on-flash byte layout is a prefix of this one — bump it ONLY on a layout-
+ * breaking change (reorder/resize/remove-with-shift), which the append-only
+ * discipline in app_config.h is designed to avoid. Any stored blob whose
+ * version >= CFG_LAYOUT_BASE migrates by prefix-copy (forward AND on rollback);
+ * anything older is reset. v13 froze the layout (per-tank probe_disagree_c[2],
+ * posix_tz). Append new fields at the END of app_config_t and bump only
+ * CFG_VERSION; leave CFG_LAYOUT_BASE at 13. */
+#define CFG_VERSION       13
+#define CFG_LAYOUT_BASE   13
 
 /* Coalescing window for deferred saves — after a save is signalled we wait
  * this long for further changes to land before committing. Tunes the
@@ -63,7 +75,8 @@ static void apply_defaults(app_config_t *c)
     c->hysteresis_c         = 3;
     c->ntc_r25_ohm          = 10000;
     c->ntc_beta             = 3950;
-    c->probe_disagree_c     = 5;
+    c->probe_disagree_c[0]  = 20;   /* inlet  — wider: stratifies during draws */
+    c->probe_disagree_c[1]  = 10;   /* outlet — delivered water, runs steadier  */
     c->power_led_mode       = POWER_LED_ALWAYS_ON;
     c->eco_led_mode         = ECO_LED_WIFI_STATE;
     c->dashboard_unit       = TEMP_UNIT_CELSIUS;
@@ -78,7 +91,21 @@ static void apply_defaults(app_config_t *c)
                                                reboot/power cut. A never-configured device still
                                                boots OFF, since last_power_state defaults to 0
                                                (memset) until the user turns it on at least once. */
+    strlcpy(c->posix_tz, "UTC0", sizeof(c->posix_tz));  /* user sets their zone */
     /* ap_ssid empty → derived from MAC at runtime */
+}
+
+/* Push the configured POSIX TZ into the C library so localtime_r()/strftime()
+ * and therefore the scheduler reason in local wall-clock. Idempotent — call at
+ * boot and whenever the timezone setting changes. */
+void app_config_apply_timezone(void)
+{
+    char tz[APP_CFG_TZ_MAX];
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    strlcpy(tz, s_cfg.posix_tz[0] ? s_cfg.posix_tz : "UTC0", sizeof(tz));
+    xSemaphoreGive(s_mutex);
+    setenv("TZ", tz, 1);
+    tzset();
 }
 
 void app_config_default_ap_ssid(char *buf, size_t buflen)
@@ -197,19 +224,39 @@ esp_err_t app_config_init(void)
         return ESP_OK;
     }
 
+    /* Tolerant, append-only migration. The blob is a raw struct, so the schema
+     * is APPEND-ONLY (see app_config.h): every version >= CFG_LAYOUT_BASE is a
+     * byte-prefix of every later one. Migrate (and roll back) by copying the
+     * overlapping prefix over the defaults already in s_cfg:
+     *   - forward  (smaller old blob → bigger struct): new tail fields keep
+     *     their defaults.
+     *   - rollback (bigger new blob → smaller struct): the extra tail bytes are
+     *     ignored. The copy is length-bounded, so it can never overrun.
+     * A blob older than CFG_LAYOUT_BASE predates this layout chain and is reset;
+     * network + auth still return via the preserve overlay below. */
     size_t sz = 0;
     err = nvs_get_blob(h, CFG_NVS_BLOB_KEY, NULL, &sz);
-    if (err == ESP_OK && sz == sizeof(app_config_t)) {
-        app_config_t tmp;
-        if (nvs_get_blob(h, CFG_NVS_BLOB_KEY, &tmp, &sz) == ESP_OK &&
-            tmp.version == CFG_VERSION) {
-            s_cfg = tmp;
-            ESP_LOGI(TAG, "config loaded (v%u, configured=%d)",
-                     (unsigned)tmp.version, (int)tmp.configured);
+    if (err == ESP_OK && sz >= sizeof(uint16_t)) {
+        uint8_t *buf = malloc(sz);
+        if (buf && nvs_get_blob(h, CFG_NVS_BLOB_KEY, buf, &sz) == ESP_OK) {
+            uint16_t ver;
+            memcpy(&ver, buf, sizeof(ver));   /* version is field 0 of the struct */
+            if (ver >= CFG_LAYOUT_BASE) {
+                size_t n = sz < sizeof(app_config_t) ? sz : sizeof(app_config_t);
+                memcpy(&s_cfg, buf, n);        /* overlapping prefix over defaults */
+                s_cfg.version = CFG_VERSION;   /* normalise so our own saves are clean */
+                ESP_LOGI(TAG, "config migrated (stored v%u → v%u, %u/%u bytes, configured=%d)",
+                         (unsigned)ver, (unsigned)CFG_VERSION, (unsigned)n,
+                         (unsigned)sizeof(app_config_t), (int)s_cfg.configured);
+            } else {
+                ESP_LOGW(TAG, "config v%u predates layout base v%u — feature config reset; "
+                              "network + auth restored from preserve store",
+                         (unsigned)ver, (unsigned)CFG_LAYOUT_BASE);
+            }
         } else {
-            ESP_LOGW(TAG, "config schema mismatch — feature config reset to "
-                          "defaults; network + auth restored from preserve store");
+            ESP_LOGW(TAG, "config blob read failed — using defaults");
         }
+        free(buf);
     } else {
         ESP_LOGI(TAG, "no stored blob — using defaults");
     }
@@ -239,6 +286,8 @@ esp_err_t app_config_init(void)
         if (serr != ESP_OK)
             ESP_LOGW(TAG, "preserve store seed failed: %s", esp_err_to_name(serr));
     }
+
+    app_config_apply_timezone();   /* localtime_r is UTC until this runs */
     return ESP_OK;
 }
 
@@ -352,6 +401,27 @@ esp_err_t app_config_factory_reset(void)
     xSemaphoreGive(s_mutex);
     ESP_LOGW(TAG, "factory reset complete");
     return ESP_OK;
+}
+
+esp_err_t app_config_erase_feature_blob(void)
+{
+    /* Drop ONLY the main config blob, leaving the netauth preserve store intact.
+     * On the next boot app_config_init() finds no blob → defaults, then the
+     * preserve overlay restores Wi-Fi + auth — so the device comes up on factory
+     * settings but stays on the network and keeps its password. Used by the OTA
+     * "reset settings" option, which runs just before the post-flash reboot. */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition(CFG_NVS_PART, CFG_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_erase_key(h, CFG_NVS_BLOB_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;   /* already absent → fine */
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK)
+        ESP_LOGW(TAG, "feature config erased — defaults on next boot (network + auth kept)");
+    else
+        ESP_LOGE(TAG, "feature config erase failed: %s", esp_err_to_name(err));
+    return err;
 }
 
 heating_mode_t app_config_get_heating_mode(void)

@@ -20,8 +20,12 @@ const { model: showerReady, min: showerMin, max: showerMax } =
   tempField(form, 'shower_ready_c', 30, 70);
 const { model: hysteresis, min: hystMin, max: hystMax } =
   tempField(form, 'hysteresis_c', 1, 10, { delta: true });
-const { model: mismatch, min: mismatchMin, max: mismatchMax } =
-  tempField(form, 'probe_disagree_c', 1, 20, { delta: true });
+/* Per-tank probe-disagreement windows. The inlet stratifies/cools faster on a
+ * draw, so its two NTCs read further apart — it gets a wider window. */
+const { model: mismatchInlet, min: mismatchInMin, max: mismatchInMax } =
+  tempField(form, 'probe_disagree_inlet_c', 1, 30, { delta: true });
+const { model: mismatchOutlet, min: mismatchOutMin, max: mismatchOutMax } =
+  tempField(form, 'probe_disagree_outlet_c', 1, 20, { delta: true });
 
 async function save() {
   /* heating_mode lives on the dashboard now — don't echo it back from the
@@ -86,9 +90,15 @@ async function save() {
           <label class="muted">Beta</label>
           <InputNumber v-model="form.ntc_beta" :min="2000" :max="5500" fluid />
         </div>
+      </div>
+      <div class="row" style="gap: 12px; margin-top: 10px;">
         <div style="flex:1">
-          <label class="muted">Mismatch threshold ({{ unitSuffix }})</label>
-          <InputNumber v-model="mismatch" :min="mismatchMin" :max="mismatchMax" fluid />
+          <label class="muted">Inlet mismatch ({{ unitSuffix }})</label>
+          <InputNumber v-model="mismatchInlet" :min="mismatchInMin" :max="mismatchInMax" fluid />
+        </div>
+        <div style="flex:1">
+          <label class="muted">Outlet mismatch ({{ unitSuffix }})</label>
+          <InputNumber v-model="mismatchOutlet" :min="mismatchOutMin" :max="mismatchOutMax" fluid />
         </div>
       </div>
     </details>
