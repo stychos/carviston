@@ -27,6 +27,12 @@ const { model: mismatchInlet, min: mismatchInMin, max: mismatchInMax } =
 const { model: mismatchOutlet, min: mismatchOutMin, max: mismatchOutMax } =
   tempField(form, 'probe_disagree_outlet_c', 1, 20, { delta: true });
 
+/* Heat-up tracking thresholds — both are temperature spans. */
+const { model: benchGap, min: benchGapMin, max: benchGapMax } =
+  tempField(form, 'bench_min_gap_c', 1, 30, { delta: true });
+const { model: drawDrop, min: drawDropMin, max: drawDropMax } =
+  tempField(form, 'draw_detect_drop_c', 1, 30, { delta: true });
+
 async function save() {
   /* heating_mode lives on the dashboard now — don't echo it back from the
    * stale form copy or we'd clobber a mode change the user made while the
@@ -101,6 +107,46 @@ async function save() {
           <InputNumber v-model="mismatchOutlet" :min="mismatchOutMin" :max="mismatchOutMax" fluid />
         </div>
       </div>
+    </details>
+
+    <details class="muted" style="margin-top: 4px;">
+      <summary style="cursor: pointer;">Advanced — energy &amp; heat-up tracking</summary>
+      <div class="row" style="gap: 12px; margin-top: 10px;">
+        <div style="flex:1">
+          <label class="muted">Inlet element power (W)</label>
+          <InputNumber v-model="form.element_watts_inlet" :min="0" :max="5000" :step="50" suffix=" W" fluid />
+        </div>
+        <div style="flex:1">
+          <label class="muted">Outlet element power (W)</label>
+          <InputNumber v-model="form.element_watts_outlet" :min="0" :max="5000" :step="50" suffix=" W" fluid />
+        </div>
+      </div>
+      <p class="muted" style="font-size: 12px; margin: 8px 0 0;">
+        Used to estimate energy consumption from relay on-time. Set these to your
+        elements' rated wattage for accurate totals.
+      </p>
+      <div class="row" style="gap: 12px; margin-top: 10px;">
+        <div style="flex:1">
+          <label class="muted">Log heat-up below target by ({{ unitSuffix }})</label>
+          <InputNumber v-model="benchGap" :min="benchGapMin" :max="benchGapMax" fluid />
+        </div>
+        <div style="flex:1">
+          <label class="muted">Water-draw drop ({{ unitSuffix }})</label>
+          <InputNumber v-model="drawDrop" :min="drawDropMin" :max="drawDropMax" fluid />
+        </div>
+      </div>
+      <div class="row" style="gap: 12px; margin-top: 10px;">
+        <div style="flex:1">
+          <label class="muted">Water-draw window (s)</label>
+          <InputNumber v-model="form.draw_detect_window_s" :min="10" :max="255" fluid />
+        </div>
+        <div style="flex:1"></div>
+      </div>
+      <p class="muted" style="font-size: 12px; margin: 8px 0 0;">
+        A heating run is logged only when heating starts at least this far below
+        target — routine top-ups are ignored. A draw (inlet falling by the drop
+        within the window) ends the current run and starts a fresh one.
+      </p>
     </details>
 
     <Button label="Save heater settings" @click="save" />

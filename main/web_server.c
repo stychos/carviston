@@ -20,6 +20,7 @@
 
 #include "app_config.h"
 #include "auth.h"
+#include "energy.h"
 #include "event_log.h"
 #include "heater_control.h"
 #include "ota.h"
@@ -358,6 +359,11 @@ static cJSON *config_to_json(const app_config_t *c)
     cJSON_AddNumberToObject(o, "long_press_ms", c->long_press_ms);
     cJSON_AddNumberToObject(o, "preview_release_ms", c->preview_release_ms);
     cJSON_AddNumberToObject(o, "bench_resume_threshold_s", c->bench_resume_threshold_s);
+    cJSON_AddNumberToObject(o, "element_watts_inlet",  c->element_watts[0]);
+    cJSON_AddNumberToObject(o, "element_watts_outlet", c->element_watts[1]);
+    cJSON_AddNumberToObject(o, "draw_detect_drop_c",   c->draw_detect_drop_c);
+    cJSON_AddNumberToObject(o, "draw_detect_window_s", c->draw_detect_window_s);
+    cJSON_AddNumberToObject(o, "bench_min_gap_c",      c->bench_min_gap_c);
     cJSON_AddBoolToObject  (o, "restore_power_on_boot", c->restore_power_on_boot);
 
     cJSON_AddBoolToObject(o, "sched_enabled", c->sched_enabled);
@@ -472,6 +478,11 @@ static esp_err_t api_config_put(httpd_req_t *req)
     UPDATE_NUM(long_press_ms,           "long_press_ms",           500, 5000);
     UPDATE_NUM(preview_release_ms,      "preview_release_ms",      500, 10000);
     UPDATE_NUM(bench_resume_threshold_s,"bench_resume_threshold_s", 0,   86400);
+    UPDATE_NUM(element_watts[0],        "element_watts_inlet",      0,   5000);
+    UPDATE_NUM(element_watts[1],        "element_watts_outlet",     0,   5000);
+    UPDATE_NUM(draw_detect_drop_c,      "draw_detect_drop_c",       1,   30);
+    UPDATE_NUM(draw_detect_window_s,    "draw_detect_window_s",     10,  255);
+    UPDATE_NUM(bench_min_gap_c,         "bench_min_gap_c",          1,   30);
 
     v = cJSON_GetObjectItemCaseSensitive(body, "dashboard_locked");
     if (cJSON_IsBool(v)) cfg.dashboard_locked = cJSON_IsTrue(v);
@@ -775,6 +786,7 @@ static void delayed_reboot_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(800));
     event_log_emit(EV_SHUTDOWN, 0, 0, NULL);
     event_log_flush();
+    energy_flush();
     esp_restart();
 }
 
@@ -914,6 +926,33 @@ static esp_err_t api_benchmarks_clear(httpd_req_t *req)
 {
     if (!require_auth(req)) return ESP_OK;
     event_log_purge_benchmarks();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    return send_json(req, o, 200);
+}
+
+/* ---------- energy ---------- */
+
+static esp_err_t api_energy(httpd_req_t *req)
+{
+    if (!require_dashboard(req)) return ESP_OK;
+    energy_totals_t e;
+    energy_get(&e);
+    cJSON *o = cJSON_CreateObject();
+    /* Reported in Wh; the UI renders kWh. day/week/month are 0 until the clock
+     * has synced (they need local-day boundaries); total always counts. */
+    cJSON_AddNumberToObject(o, "today_wh", e.today_wh);
+    cJSON_AddNumberToObject(o, "week_wh",  e.week_wh);
+    cJSON_AddNumberToObject(o, "month_wh", e.month_wh);
+    cJSON_AddNumberToObject(o, "total_wh", e.total_wh);
+    cJSON_AddBoolToObject  (o, "time_synced", wifi_mgr_time_synced());
+    return send_json(req, o, 200);
+}
+
+static esp_err_t api_energy_clear(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    energy_clear();
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "ok", true);
     return send_json(req, o, 200);
@@ -1217,6 +1256,8 @@ esp_err_t web_server_start(void)
     ROUTE("/api/log", HTTP_GET, api_log);
     ROUTE("/api/log/clear",        HTTP_POST, api_log_clear);
     ROUTE("/api/benchmarks/clear", HTTP_POST, api_benchmarks_clear);
+    ROUTE("/api/energy",       HTTP_GET,  api_energy);
+    ROUTE("/api/energy/clear", HTTP_POST, api_energy_clear);
 
     ROUTE("/api/ota", HTTP_POST, ota_upload_handler);
 

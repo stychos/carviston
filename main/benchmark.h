@@ -1,16 +1,19 @@
-/* benchmark — track heating "sessions" for performance logging.
+/* benchmark — track heating "programs" for performance logging.
  *
- * A session begins the moment the controller enters "heating phase" (any of
- * the four modes is actively driving relays toward the target) and ends when
- * heating phase exits — whether the target was reached, the user changed the
- * mode/target, or master power was turned off.
+ * A program models one meaningful heat-up: it begins when heating starts with a
+ * real gap to target (a fresh power-on, a raised setpoint, or heating resuming
+ * after a water draw) and ends when the target is reached — OR when a water
+ * draw interrupts it. Routine hysteresis maintenance cycling (the small reheats
+ * that keep the tank at target) does NOT start a program, so the log isn't
+ * spammed with short runs. See heater_control's call site and app_config's
+ * bench_min_gap_c / draw_detect_* fields.
  *
- * Active sessions are persisted to NVS so a reboot can resume them — but only
+ * Active programs are persisted to NVS so a reboot can resume them — but only
  * if the elapsed wall time between shutdown and reboot is within
  * `bench_resume_threshold_s` (from app_config). Wall time requires SNTP; if
- * the clock hasn't synced (e.g. AP-only mode), the active session is aborted.
+ * the clock hasn't synced (e.g. AP-only mode), the active program is aborted.
  *
- * Completed sessions surface via the event_log as EV_BENCH_END / EV_BENCH_ABORT.
+ * Completed programs surface via the event_log as EV_BENCH_END / EV_BENCH_ABORT.
  */
 
 #pragma once
@@ -20,29 +23,32 @@
 
 #include "esp_err.h"
 
+#include "app_config.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef enum {
     BENCH_END_TARGET_REACHED = 0,
-    BENCH_END_MODE_CHANGED,
-    BENCH_END_TARGET_CHANGED,
+    BENCH_END_MODE_CHANGED,    /* retired — kept for log/value stability */
+    BENCH_END_TARGET_CHANGED,  /* retired — kept for log/value stability */
     BENCH_END_MASTER_OFF,
     BENCH_END_SAFETY_FAULT,
     BENCH_END_REBOOT,
+    BENCH_END_WATER_DRAW,      /* a draw interrupted the heat-up */
 } bench_end_reason_t;
 
 esp_err_t benchmark_init(void);
 
-/* Called from heater_control every tick. Drives the state machine. */
-void benchmark_tick(bool heating_phase, uint8_t mode, uint8_t target_c, float water_c,
-                    bool master_enabled, int safety);
-
-/* External transitions worth noticing immediately (so the bench is split at
- * the right boundary, not deferred to the next tick). */
-void benchmark_note_mode_change(uint8_t new_mode);
-void benchmark_note_target_change(uint8_t new_target);
+/* Called from heater_control every tick. Drives the program state machine.
+ *  - heating_phase : thermostat demand (a tank wants heat this tick)
+ *  - water_c       : whole-heater temperature (program gap is measured off this)
+ *  - inlet_c       : inlet regulation temperature (fed to the water-draw detector)
+ *  - cfg           : live config (thresholds); borrowed, not retained */
+void benchmark_tick(bool heating_phase, uint8_t mode, uint8_t target_c,
+                    float water_c, float inlet_c, bool master_enabled, int safety,
+                    const app_config_t *cfg);
 
 #ifdef __cplusplus
 }

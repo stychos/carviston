@@ -15,6 +15,7 @@ idf_component_register(
         "ota.c"
         "event_log.c"
         "benchmark.c"
+        "energy.c"
     INCLUDE_DIRS
         "."
     REQUIRES

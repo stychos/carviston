@@ -8,6 +8,7 @@
 #include "auth.h"
 #include "benchmark.h"
 #include "buttons.h"
+#include "energy.h"
 #include "event_log.h"
 #include "heater_control.h"
 #include "leds.h"
@@ -42,6 +43,7 @@ void app_main(void)
     ESP_ERROR_CHECK(app_config_init());
     ESP_ERROR_CHECK(event_log_init());
     ESP_ERROR_CHECK(benchmark_init());
+    ESP_ERROR_CHECK(energy_init());
 
     char ap[24];
     app_config_default_ap_ssid(ap, sizeof(ap));

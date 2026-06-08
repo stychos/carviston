@@ -152,30 +152,56 @@ esp_err_t benchmark_init(void)
     return ESP_OK;
 }
 
-void benchmark_note_mode_change(uint8_t new_mode)
+/* --- water-draw detector -------------------------------------------------
+ *
+ * A draw dumps cold feed into the inlet tank, so its regulation NTC lurches
+ * down far faster than passive cooling ever could. We keep a 1 Hz ring of
+ * recent inlet temperatures and flag a draw when the reading from
+ * `draw_detect_window_s` ago is at least `draw_detect_drop_c` warmer than now.
+ * Comparing against the windowed-past sample (rather than a running peak) makes
+ * the flag clear quickly once the water starts recovering — so the post-draw
+ * heat-up isn't blocked from being logged as its own program. */
+#define DRAW_RING_CAP 256
+
+static float    s_inlet_ring[DRAW_RING_CAP];
+static uint16_t s_inlet_head;    /* next write index */
+static uint16_t s_inlet_count;   /* samples held (saturates at DRAW_RING_CAP) */
+
+static bool draw_detect_locked(float inlet_c, const app_config_t *cfg)
 {
-    if (!s_inited) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_act.in_progress && s_act.mode != new_mode) {
-        end_bench(BENCH_END_MODE_CHANGED, NAN);
+    if (isnan(inlet_c)) {            /* sensor loss — drop history, no false draw */
+        s_inlet_head = 0;
+        s_inlet_count = 0;
+        return false;
     }
-    xSemaphoreGive(s_lock);
+    uint16_t win = cfg->draw_detect_window_s ? cfg->draw_detect_window_s : 90;
+    if (win > DRAW_RING_CAP - 1) win = DRAW_RING_CAP - 1;
+    float drop = cfg->draw_detect_drop_c ? (float)cfg->draw_detect_drop_c : 5.0f;
+
+    bool draw = false;
+    if (s_inlet_count >= win) {
+        uint16_t idx = (uint16_t)((s_inlet_head + DRAW_RING_CAP - win) % DRAW_RING_CAP);
+        if (s_inlet_ring[idx] - inlet_c >= drop) draw = true;
+    }
+    s_inlet_ring[s_inlet_head] = inlet_c;
+    s_inlet_head = (uint16_t)((s_inlet_head + 1) % DRAW_RING_CAP);
+    if (s_inlet_count < DRAW_RING_CAP) s_inlet_count++;
+    return draw;
 }
 
-void benchmark_note_target_change(uint8_t new_target)
-{
-    if (!s_inited) return;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    if (s_act.in_progress && s_act.target_c != new_target) {
-        end_bench(BENCH_END_TARGET_CHANGED, NAN);
-    }
-    xSemaphoreGive(s_lock);
-}
+/* Program-segmentation state (distinct from s_act.in_progress, which is the
+ * running program itself). s_drawing suppresses program starts while a draw is
+ * in progress; s_draw_arm_s arms "heating resumed after a draw" for a window
+ * after the draw subsides, so the recovery heat-up logs as its own program even
+ * if its gap-to-target is modest. */
+static bool     s_drawing;
+static uint16_t s_draw_arm_s;
 
-void benchmark_tick(bool heating_phase, uint8_t mode, uint8_t target_c, float water_c,
-                    bool master_enabled, int safety)
+void benchmark_tick(bool heating_phase, uint8_t mode, uint8_t target_c,
+                    float water_c, float inlet_c, bool master_enabled, int safety,
+                    const app_config_t *cfg)
 {
-    if (!s_inited) return;
+    if (!s_inited || !cfg) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     /* deferred resume attempt — covers the case where SNTP synced after init.
      * Run AT MOST once after init regardless of outcome: a successful resume
@@ -188,25 +214,48 @@ void benchmark_tick(bool heating_phase, uint8_t mode, uint8_t target_c, float wa
         resume_attempted_after_sync = true;
     }
 
+    bool draw_now = draw_detect_locked(inlet_c, cfg);
+
     if (!master_enabled) {
         if (s_act.in_progress) end_bench(BENCH_END_MASTER_OFF, water_c);
+        s_drawing = false; s_draw_arm_s = 0;
         xSemaphoreGive(s_lock);
         return;
     }
     if (safety != 0) {
         if (s_act.in_progress) end_bench(BENCH_END_SAFETY_FAULT, water_c);
+        s_drawing = false; s_draw_arm_s = 0;
         xSemaphoreGive(s_lock);
         return;
     }
 
+    /* Draw edges: a draw ends the active program and arms the next one. While a
+     * draw is ongoing we hold off starting a new program; once it subsides the
+     * arm window counts down and lets the recovery heat-up start. */
+    if (draw_now) {
+        if (s_act.in_progress) end_bench(BENCH_END_WATER_DRAW, water_c);
+        s_drawing = true;
+        s_draw_arm_s = cfg->draw_detect_window_s ? cfg->draw_detect_window_s : 90;
+    } else {
+        s_drawing = false;
+        if (s_draw_arm_s > 0) s_draw_arm_s--;
+    }
+
     if (heating_phase) {
-        if (!s_act.in_progress) {
-            start_bench(mode, target_c, water_c);
-        } else if (s_act.mode != mode || s_act.target_c != target_c) {
-            /* split at the boundary */
-            end_bench(s_act.mode != mode ? BENCH_END_MODE_CHANGED : BENCH_END_TARGET_CHANGED,
-                      water_c);
-            start_bench(mode, target_c, water_c);
+        if (!s_act.in_progress && !s_drawing) {
+            uint8_t gap_min = cfg->bench_min_gap_c ? cfg->bench_min_gap_c : 5;
+            bool big_gap   = !isnan(water_c) && water_c <= (float)target_c - (float)gap_min;
+            bool after_draw = s_draw_arm_s > 0;
+            if (big_gap || after_draw) {
+                start_bench(mode, target_c, water_c);
+                s_draw_arm_s = 0;   /* consumed */
+            }
+        } else if (s_act.in_progress) {
+            /* A mid-program mode/target tweak extends the SAME run rather than
+             * splitting it — keep the recorded mode/target current so the end
+             * record reflects where the heat-up actually finished. */
+            s_act.mode     = mode;
+            s_act.target_c = target_c;
         }
     } else {
         if (s_act.in_progress) end_bench(BENCH_END_TARGET_REACHED, water_c);

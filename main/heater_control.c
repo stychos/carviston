@@ -13,6 +13,7 @@
 #include "app_config.h"
 #include "benchmark.h"
 #include "buttons.h"
+#include "energy.h"
 #include "event_log.h"
 #include "leds.h"
 #include "relays.h"
@@ -82,7 +83,8 @@ void heater_set_target(uint8_t celsius)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_state.target_c = chosen;
     xSemaphoreGive(s_lock);
-    benchmark_note_target_change(chosen);
+    /* A target change no longer splits the active heating program — the run
+     * continues toward the new target (benchmark_tick tracks it). */
     event_log_emit(EV_TARGET_CHANGE, chosen, 0, NULL);
     /* The +/- press handler also calls leds_target_preview_press so that the
      * preview survives across multiple taps. From the web API path the
@@ -130,7 +132,8 @@ void heater_atomic_swap_mode(heating_mode_t new_mode, heating_mode_t *prev_out)
             cfg.heating_mode = new_mode;
             app_config_save_deferred(&cfg);
         }
-        benchmark_note_mode_change((uint8_t)new_mode);
+        /* A mode change no longer splits the active heating program — only the
+         * power policy changes; the heat-up toward target continues. */
         event_log_emit(EV_MODE_CHANGE, (int16_t)new_mode, 0, NULL);
     }
 }
@@ -623,9 +626,16 @@ static void control_task(void *arg)
         }
         xSemaphoreGive(s_lock);
 
-        /* Benchmark tracking — driven from the same tick as control. */
+        /* Benchmark (heat-up program) tracking — driven from the same tick as
+         * control. Uses the RAW water temperature and the inlet regulation
+         * reading (the draw detector watches the inlet). */
         benchmark_tick(heating_needed, (uint8_t)s_state.mode, cfg.target_temp_c,
-                       temp.water_c, s_state.master_enabled, (int)safety);
+                       temp.water_c, temp.tank[TANK_INLET].regulation_c,
+                       s_state.master_enabled, (int)safety, &cfg);
+
+        /* Energy accounting — integrate relay on-time × per-element watts. Runs
+         * every tick (accrues during maintenance too), independent of programs. */
+        energy_account(relays_cmd, cfg.element_watts);
 
         /* Heater on/off transitions → event log. */
         static bool last_h[2];

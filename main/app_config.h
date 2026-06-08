@@ -161,6 +161,22 @@ typedef struct {
      * offset. See app_config_apply_timezone(). */
     char          posix_tz[APP_CFG_TZ_MAX];
 
+    /* --- energy + heat-up tracking --- */
+    /* Per-element electrical power (W), used to estimate consumed energy by
+     * integrating relay on-time × watts. [0]=inlet, [1]=outlet; default 1500. */
+    uint16_t element_watts[2];
+    /* Water-draw detector (used to segment heating "programs"): a draw is flagged
+     * when the inlet regulation temperature falls by >= draw_detect_drop_c within
+     * draw_detect_window_s. A draw ends the active program and arms the next one.
+     * Defaults: 5 °C over 90 s — fast/deep enough to separate a real draw from
+     * slow passive cooling or the hysteresis maintenance band. */
+    uint8_t  draw_detect_drop_c;
+    uint16_t draw_detect_window_s;
+    /* A heating program is logged only when heating begins with at least this
+     * many °C still to go to target — so routine hysteresis reheats (gap ~0)
+     * don't spam the log with short runs. Default 5. */
+    uint8_t  bench_min_gap_c;
+
 } app_config_t;
 
 /* Load config from NVS, applying defaults for any missing fields.

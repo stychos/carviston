@@ -27,8 +27,9 @@ static const char *TAG = "app_config";
  * version >= CFG_LAYOUT_BASE migrates by prefix-copy (forward AND on rollback);
  * anything older is reset. v13 froze the layout (per-tank probe_disagree_c[2],
  * posix_tz). Append new fields at the END of app_config_t and bump only
- * CFG_VERSION; leave CFG_LAYOUT_BASE at 13. */
-#define CFG_VERSION       13
+ * CFG_VERSION; leave CFG_LAYOUT_BASE at 13. v14 appended element_watts[2],
+ * draw_detect_drop_c, draw_detect_window_s, bench_min_gap_c. */
+#define CFG_VERSION       14
 #define CFG_LAYOUT_BASE   13
 
 /* Coalescing window for deferred saves — after a save is signalled we wait
@@ -92,6 +93,11 @@ static void apply_defaults(app_config_t *c)
                                                boots OFF, since last_power_state defaults to 0
                                                (memset) until the user turns it on at least once. */
     strlcpy(c->posix_tz, "UTC0", sizeof(c->posix_tz));  /* user sets their zone */
+    c->element_watts[0]     = 1500;   /* matches the 2× 1.5 kW elements assumed elsewhere */
+    c->element_watts[1]     = 1500;
+    c->draw_detect_drop_c   = 5;
+    c->draw_detect_window_s = 90;
+    c->bench_min_gap_c      = 5;
     /* ap_ssid empty → derived from MAC at runtime */
 }
 
@@ -386,7 +392,7 @@ esp_err_t app_config_factory_reset(void)
      * namespaces here means a previous owner's event log, in-flight
      * benchmark, or future module data survives a hardware reset and is
      * served to the next user. */
-    static const char *namespaces[] = { CFG_NVS_NS, "evtlog", "bench" };
+    static const char *namespaces[] = { CFG_NVS_NS, "evtlog", "bench", "energy" };
     for (size_t i = 0; i < sizeof(namespaces) / sizeof(namespaces[0]); ++i) {
         nvs_handle_t h;
         if (nvs_open_from_partition(CFG_NVS_PART, namespaces[i],

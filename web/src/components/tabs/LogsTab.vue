@@ -11,14 +11,26 @@ import { isFahrenheit, cToF, unitSuffix } from '../../composables/units.js';
 const confirm = useConfirm();
 const toast = useToast();
 const data = ref({ events: [], current_boot: 0 });
+const energy = ref({ today_wh: 0, week_wh: 0, month_wh: 0, total_wh: 0, time_synced: false });
 const loading = ref(false);
 let timer = null;
 
 async function refresh() {
   loading.value = true;
-  try { data.value = await api.get('/api/log'); }
+  try {
+    const [log, en] = await Promise.all([api.get('/api/log'), api.get('/api/energy')]);
+    data.value = log;
+    energy.value = en;
+  }
   catch {}
   finally { loading.value = false; }
+}
+
+/* Wh → "1.23 kWh" (or Wh under 1 kWh). */
+function fmtEnergy(wh) {
+  if (!wh || wh < 1) return '0 kWh';
+  if (wh < 1000) return Math.round(wh) + ' Wh';
+  return (wh / 1000).toFixed(2) + ' kWh';
 }
 
 /* Both clears are destructive and irreversible, so gate behind a confirm.
@@ -46,6 +58,20 @@ function clearBenchmarks() {
     accept: async () => {
       try { await api.post('/api/benchmarks/clear'); await refresh();
             toast.add({ severity: 'success', summary: 'Heating performance cleared', life: 1500 }); }
+      catch (e) { toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 }); }
+    },
+  });
+}
+
+function clearEnergy() {
+  confirm.require({
+    header: 'Reset energy counters',
+    message: 'Reset the energy-usage totals (today, week, month and lifetime) to zero?',
+    icon: 'pi pi-trash',
+    acceptLabel: 'Reset', rejectLabel: 'Cancel', acceptProps: { severity: 'danger' },
+    accept: async () => {
+      try { await api.post('/api/energy/clear'); await refresh();
+            toast.add({ severity: 'success', summary: 'Energy counters reset', life: 1500 }); }
       catch (e) { toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 }); }
     },
   });
@@ -191,6 +217,20 @@ const benchmarks = computed(() => {
     </div>
 
     <div class="spaced" style="margin-top: 16px;">
+      <h4 style="margin: 0;">Energy used <span class="muted" style="font-weight: normal; font-size: 12px;">(estimated)</span></h4>
+      <Button label="Reset" size="small" icon="pi pi-trash" text severity="danger" @click="clearEnergy" />
+    </div>
+    <div class="energy-grid">
+      <div class="energy-cell"><div class="energy-val">{{ fmtEnergy(energy.today_wh) }}</div><div class="muted">Today</div></div>
+      <div class="energy-cell"><div class="energy-val">{{ fmtEnergy(energy.week_wh) }}</div><div class="muted">7 days</div></div>
+      <div class="energy-cell"><div class="energy-val">{{ fmtEnergy(energy.month_wh) }}</div><div class="muted">30 days</div></div>
+      <div class="energy-cell"><div class="energy-val">{{ fmtEnergy(energy.total_wh) }}</div><div class="muted">Lifetime</div></div>
+    </div>
+    <div v-if="!energy.time_synced" class="muted" style="font-size: 12px; margin-top: 6px;">
+      Daily/weekly/monthly totals need the clock to sync; only the lifetime total is counted until then.
+    </div>
+
+    <div class="spaced" style="margin-top: 16px;">
       <h4 style="margin: 0;">Heating performance</h4>
       <Button label="Clear" size="small" icon="pi pi-trash" text severity="danger"
               :disabled="!benchmarks.length" @click="clearBenchmarks" />
@@ -267,5 +307,24 @@ const benchmarks = computed(() => {
 .log-detail {
   color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.energy-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.energy-cell {
+  text-align: center;
+  padding: 12px 8px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface-2);
+}
+.energy-val {
+  font-size: 18px; font-weight: 600; color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 520px) {
+  .energy-grid { grid-template-columns: repeat(2, 1fr); }
 }
 </style>
