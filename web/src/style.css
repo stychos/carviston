@@ -112,7 +112,11 @@ body { overscroll-behavior: none; }
 }
 .muted { color: var(--muted); }
 
-.stack { display: grid; gap: 16px; }
+/* minmax(0,1fr) caps the column at the container width: grid items default to
+ * min-width:auto, so without the 0-floor a child with a wide min-content (e.g.
+ * a Select with a long label) would stretch the track — and any dialog hosting
+ * the stack — past its intended width. */
+.stack { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
 .row { display: flex; gap: 8px; align-items: center; }
 .row.wrap { flex-wrap: wrap; }
 .spaced { display: flex; justify-content: space-between; align-items: center; }

@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "mdns.h"
 #include "time.h"
+#include <sys/time.h>
 
 #include "app_config.h"
 #include "event_log.h"
@@ -44,6 +45,7 @@ static int8_t  s_rssi;
 static bool    s_started;
 static bool    s_sntp_started;
 static volatile bool s_time_synced;
+static volatile bool s_time_manual;   /* clock seeded by the user, not SNTP */
 
 /* When true, suppress auto-reconnect inside the disconnect event handler —
  * a higher-level path (force_ap, restart) is intentionally tearing things
@@ -125,6 +127,10 @@ static void on_sntp_sync(struct timeval *tv)
 {
     (void)tv;
     s_time_synced = true;
+    /* A real sync supersedes any manual seed; restore the configured TZ in case
+     * a prior manual set forced UTC0 this boot (recovery-AP → reconnect). */
+    s_time_manual = false;
+    app_config_apply_timezone();
     time_t now = time(NULL);
     struct tm tm; gmtime_r(&now, &tm);
     ESP_LOGI("sntp", "time synced: %04d-%02d-%02d %02d:%02d:%02d UTC",
@@ -537,6 +543,28 @@ esp_err_t wifi_mgr_force_ap_mode(void)
 }
 
 bool wifi_mgr_time_synced(void) { return s_time_synced; }
+
+bool wifi_mgr_time_manual(void) { return s_time_manual; }
+
+void wifi_mgr_set_manual_time(time_t local_epoch)
+{
+    /* The user enters their LOCAL wall-clock. Run the C library in UTC0 so
+     * localtime_r() returns exactly those components — the scheduler reasons in
+     * local wall-clock, and with UTC0 that IS the entered time. No DST math: a
+     * hand-set clock is the user's responsibility, and it's transient anyway. */
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    struct timeval tv = { .tv_sec = local_epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    s_time_manual = true;
+    s_time_synced = true;
+
+    struct tm lt; localtime_r(&local_epoch, &lt);
+    ESP_LOGI(TAG, "manual time set: %04d-%02d-%02d %02d:%02d:%02d (UTC0)",
+             lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
+             lt.tm_hour, lt.tm_min, lt.tm_sec);
+    event_log_emit(EV_TIME_SYNCED, 0, 0, NULL);
+}
 
 wifi_state_t wifi_mgr_state(void) { return s_state; }
 

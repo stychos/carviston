@@ -5,6 +5,7 @@ import Checkbox from 'primevue/checkbox';
 import Select from 'primevue/select';
 import { useToast } from 'primevue/usetoast';
 import { state as liveState } from '../../composables/liveState.js';
+import { api } from '../../composables/api.js';
 
 const props = defineProps({
   cfg: Object,
@@ -14,12 +15,50 @@ const toast = useToast();
 
 const SCHED_MAX = 16;
 
-/* The device reasons about schedule times in LOCAL wall-clock, which only works
- * once SNTP has synced — impossible in AP mode (no internet). The firmware
- * refuses to fire an unsynced schedule; here we mirror that by locking the
- * editor and showing the device's own clock so a wrong timezone is obvious. */
+const pad = n => String(n).padStart(2, '0');
+
+/* The device reasons about schedule times in LOCAL wall-clock. In STA mode that
+ * comes from SNTP; in AP mode (no internet) the user seeds it by hand. Either
+ * way the firmware refuses to fire until the clock is usable, so we show the
+ * device's own clock and lock the editor until it is. */
 const deviceTime = computed(() => liveState.value?.device_time || null);
 const clockReady = computed(() => liveState.value?.time_synced === true);
+const clockManual = computed(() => liveState.value?.time_manual === true);
+
+/* AP mode (WIFI_ROLE_AP = 0) can't sync at all, so it always gets the manual
+ * set-the-clock control instead of the timezone selector. STA keeps the
+ * selector + SNTP path, but ALSO offers manual set whenever it hasn't actually
+ * synced (no internet) or is currently running a manual clock — so an offline
+ * STA can still drive the scheduler until NTP comes through. */
+const isAP = computed(() => props.cfg.wifi_mode === 0);
+const showManual = computed(() => isAP.value || !clockReady.value || clockManual.value);
+
+/* datetime-local <input> bound value, prefilled with the browser's wall-clock. */
+function nowLocalInput() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+         `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+const manualTime = ref(nowLocalInput());
+
+async function setManualTime() {
+  const d = new Date(manualTime.value);
+  if (isNaN(d.getTime())) {
+    toast.add({ severity: 'warn', summary: 'Enter a valid date & time', life: 2500 });
+    return;
+  }
+  /* Send the entered LOCAL components reinterpreted as UTC0: the firmware runs
+   * its clock in UTC0 so localtime reads back exactly these values. */
+  const epoch = Math.floor(Date.UTC(
+    d.getFullYear(), d.getMonth(), d.getDate(),
+    d.getHours(), d.getMinutes(), d.getSeconds()) / 1000);
+  try {
+    await api.post('/api/time', { epoch });
+    toast.add({ severity: 'success', summary: 'Device time set', life: 2000 });
+  } catch (e) {
+    toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
+  }
+}
 
 /* Curated POSIX TZ strings (DST rules baked in where the zone observes it). The
  * value is what the firmware feeds setenv("TZ"). */
@@ -56,8 +95,6 @@ const ACTIONS = [
   { label: 'On',  value: 1 },
   { label: 'Off', value: 0 },
 ];
-
-const pad = n => String(n).padStart(2, '0');
 
 function fromCfg() {
   const list = Array.isArray(props.cfg.schedule) ? props.cfg.schedule : [];
@@ -112,8 +149,12 @@ async function save() {
       enabled: !!r.enabled,
     });
   }
+  /* No timezone concept in AP mode — the manual clock runs in UTC0, so don't
+   * push (and risk clobbering) the stored POSIX TZ. */
+  const payload = { sched_enabled: !!state.value.enabled, schedule };
+  if (!isAP.value) payload.timezone = tz.value;
   try {
-    await props.onSave({ sched_enabled: !!state.value.enabled, schedule, timezone: tz.value });
+    await props.onSave(payload);
     toast.add({ severity: 'success', summary: 'Schedule saved', life: 2000 });
   } catch (e) {
     toast.add({ severity: 'error', summary: 'Failed', detail: e.message, life: 3000 });
@@ -129,21 +170,42 @@ async function save() {
       <div class="spaced">
         <span class="muted">Device time</span>
         <span class="clock-val" :class="{ stale: !clockReady }">
-          {{ clockReady ? deviceTime : 'clock not synced' }}
+          {{ clockReady ? deviceTime : 'clock not set' }}
         </span>
       </div>
-      <div class="row tz-row">
+
+      <!-- STA keeps a timezone selector — used once the device is online and
+           SNTP supplies real UTC. -->
+      <div v-if="!isAP" class="row tz-row">
         <label class="muted" for="sched-tz">Timezone</label>
         <Select inputId="sched-tz" v-model="tz" :options="ZONES"
                 optionLabel="label" optionValue="value" filter class="tz-sel" />
       </div>
+
+      <!-- Manual clock: AP always, or any mode that can't (yet) sync. -->
+      <div v-if="showManual" class="row tz-row set-time-row">
+        <label class="muted" for="sched-time">Set time</label>
+        <input id="sched-time" type="datetime-local" v-model="manualTime" class="dt-input" />
+        <Button label="Set" icon="pi pi-check" size="small" @click="setManualTime" />
+      </div>
     </div>
 
+    <!-- No usable clock yet: scheduler is off until one is set. -->
     <div v-if="!clockReady" class="tile warn-banner">
-      The clock hasn’t synced, so scheduled actions won’t run. Time sync needs
-      Wi-Fi <strong>station mode</strong> with internet — it can’t happen in AP
-      mode. Connect the device to your network and the scheduler activates
-      automatically once the clock syncs.
+      Scheduled actions won’t run until the device clock is set. Set it
+      <strong>above</strong> to start the scheduler now.<template v-if="!isAP">
+      The device also switches to automatic time on its own once it reaches the
+      internet.</template> A manually set clock <strong>is lost on reboot</strong>,
+      after which the scheduler stays off until you set it again.
+    </div>
+
+    <!-- Running on a hand-set clock — make the reboot behaviour explicit. -->
+    <div v-else-if="clockManual" class="tile warn-banner">
+      <strong>This clock was set manually and isn’t kept across a reboot.</strong>
+      After a power cycle the scheduler stays off until you set the time again.<template v-if="!isAP">
+      It will switch to automatic time once the device can sync over the
+      internet.</template><template v-else> For automatic, persistent timekeeping,
+      connect the device to Wi-Fi in <strong>station mode</strong>.</template>
     </div>
 
     <div class="sched-body" :class="{ locked: !clockReady }">
@@ -175,7 +237,7 @@ async function save() {
                 class="day-chip" :class="{ on: row.days & d.bit }"
                 :title="d.title" @click="toggleDay(row, d.bit)">{{ d.label }}</button>
       </div>
-      <Button icon="pi pi-trash" severity="danger" text rounded
+      <Button icon="pi pi-trash" severity="danger" text rounded class="sched-del"
               aria-label="Remove" @click="removeRow(i)" />
     </div>
     </div><!-- /.sched-body -->
@@ -190,7 +252,22 @@ async function save() {
 .clock-val.stale { color: var(--muted); font-weight: 400; font-style: italic; }
 .tz-row { gap: 10px; align-items: center; }
 .tz-row label { min-width: 80px; }
-.tz-sel { flex: 1; }
+/* min-width:0 lets the select shrink below its (long) label's intrinsic width
+ * so it can't push the dialog wider than the viewport; the label ellipsizes. */
+.tz-sel { flex: 1; min-width: 0; }
+.tz-sel :deep(.p-select-label) { overflow: hidden; text-overflow: ellipsis; }
+
+.set-time-row .dt-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.set-time-row .dt-input::-webkit-calendar-picker-indicator { filter: invert(0.7); }
 
 .warn-banner {
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
@@ -242,8 +319,22 @@ async function save() {
   color: #fff;
 }
 
+/* On phones the single row overflows: time + action + 7 day-chips + trash is
+ * wider than the screen. Wrap into a two-line card — controls on line 1, the
+ * day chips spanning full width on line 2 (chips ordered after the trash so
+ * they drop below it, not between the controls). */
 @media (max-width: 520px) {
-  .sched-days { gap: 3px; }
-  .day-chip { width: 24px; height: 24px; }
+  .sched-row { flex-wrap: wrap; row-gap: 10px; }
+  .time-input { flex: 1; min-width: 0; }
+  .action-sel { width: auto; flex: 1; min-width: 0; }
+  .sched-del { order: 1; margin-left: auto; }
+  .sched-days {
+    order: 2;
+    flex: none;
+    flex-basis: 100%;
+    justify-content: space-between;
+    gap: 4px;
+  }
+  .day-chip { width: 32px; height: 32px; font-size: 12px; }
 }
 </style>

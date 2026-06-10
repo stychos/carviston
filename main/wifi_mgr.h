@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "esp_err.h"
 
@@ -61,8 +62,19 @@ esp_err_t wifi_mgr_restart(void);
  * the stored wifi_mode in app_config — next reboot uses the saved setting. */
 esp_err_t wifi_mgr_force_ap_mode(void);
 
-/* True once SNTP has populated wall-clock time. */
+/* True once the wall-clock is usable — either SNTP synced (STA) or the user
+ * seeded it manually (AP-mode fallback). Gates the scheduler. */
 bool wifi_mgr_time_synced(void);
+
+/* True only when the clock was seeded by wifi_mgr_set_manual_time() rather than
+ * SNTP. The UI uses this to warn that a manual clock is lost on reboot. */
+bool wifi_mgr_time_manual(void);
+
+/* Seed the system clock from a user-supplied LOCAL wall-clock (epoch seconds,
+ * interpreted in UTC0 so localtime_r() reads back exactly the entered values).
+ * Opens the scheduler gate without SNTP — the AP-mode path. NOT persisted: a
+ * reboot drops it and the scheduler stays inert until it's set again. */
+void wifi_mgr_set_manual_time(time_t local_epoch);
 
 wifi_state_t wifi_mgr_state(void);
 

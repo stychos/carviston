@@ -10,7 +10,7 @@ import { useConfirm } from 'primevue/useconfirm';
 import { useToast } from 'primevue/usetoast';
 import { api } from '../../composables/api.js';
 import { token } from '../../composables/api.js';
-import { state } from '../../composables/liveState.js';
+import { state, disconnectLive, connectLive } from '../../composables/liveState.js';
 import { safetyLabel } from '../../composables/safety.js';
 
 const confirm = useConfirm();
@@ -66,28 +66,41 @@ function fetchWithTimeout(url, ms) {
  * (1.5 s fetch timeout + 0.7 s gap). A plain reboot returns within a few. */
 const REBOOT_POLL_MAX = 90;
 
-/* Poll /api/auth/status until the device has gone offline and then come back —
- * i.e. it actually rebooted. We don't look at firmware ids or boot counters,
- * just reachability. The device runs a single-task HTTP server, so it answers
- * nothing the whole time it's writing flash and rebooting; a GET that succeeds
- * *after* we've seen it unreachable means it's up again on the new firmware.
+/* Poll /api/auth/status until we can prove the device rebooted onto the
+ * expected image. Two independent success signals, in priority order:
  *
- * Requiring the offline→online transition (not merely "it answered") is what
- * tells a real reboot apart from an upload that aborted with the old image
- * still serving: there the device never drops offline, so we never see the
- * transition, keep polling, and time out → reported as a failure. */
-async function waitForReboot() {
+ *  1. fw CHANGED (OTA only) — /api/auth/status carries a short id of the running
+ *     firmware (running_fw_id() in web_server.c, built for exactly this). When
+ *     the caller hands us the pre-upload `baselineFw`, a reply whose `fw` DIFFERS
+ *     is unambiguous proof the NEW image is up. This is a positive LEVEL test, so
+ *     it works even if we start polling after the device is already back — which
+ *     is the case the OTA flow routinely hits: the success reply is often lost
+ *     and esp_restart can drop the socket silently, so polling may not begin
+ *     until the device has finished a (fast) reboot. Relying only on signal 2
+ *     below missed that window and stranded the dialog.
+ *
+ *  2. offline → online edge — for same-fw restarts (plain reboot, factory reset)
+ *     there is no fw change to see, so we fall back to "went unreachable, then
+ *     answered again". Requiring the transition (not merely "it answered") is
+ *     what tells a real reboot apart from an upload that aborted with the OLD
+ *     image still serving: there the device neither drops offline NOR changes fw,
+ *     so neither signal fires, we time out, and report failure — as intended. */
+async function waitForReboot(baselineFw) {
   rebootAttempt.value = 0;
   let sawDown = false;
   for (let i = 0; i < REBOOT_POLL_MAX; i++) {
     rebootAttempt.value = i + 1;
     let up = false;
+    let fw = null;
     try {
       const r = await fetchWithTimeout('/api/auth/status', 1500);
       up = r.ok;
+      if (up) fw = (await r.json().catch(() => null))?.fw ?? null;
     } catch { up = false; /* device still down or fetch aborted */ }
+    /* New firmware confirmed — done regardless of whether we ever saw it drop. */
+    if (up && baselineFw && fw && fw !== baselineFw) return true;
     if (!up)          sawDown = true;   /* offline — still writing / rebooting */
-    else if (sawDown) return true;      /* offline → online: it came back */
+    else if (sawDown) return true;      /* offline → online: it came back (same fw) */
     await new Promise(r => setTimeout(r, 700));
   }
   return false;
@@ -101,6 +114,10 @@ function resolveReturn(cameBack, failMsg) {
   } else {
     otaPhase.value = 'error';
     otaError.value = failMsg;
+    /* We tore down live polling for the duration of the restart flow; the page
+     * won't reload now, so bring it back so the dashboard behind the error
+     * dialog keeps updating (idempotent — connectLive() no-ops if already up). */
+    connectLive();
   }
 }
 
@@ -116,10 +133,19 @@ function manualReload() {
  * directly (reboot / factory-reset / boot-switch) or after an OTA upload's
  * 200 reply. */
 async function runRebootFlow(title) {
+  /* Stop background live-polling before we start watching for the return:
+   * liveState's /api/state GETs are un-abortable (no timeout) and, against the
+   * single-task server that goes dark across a restart, hang and tie up the
+   * browser's small per-host connection pool — which can starve waitForReboot's
+   * own probe. The post-return reload re-runs connectLive(); the error path
+   * (resolveReturn) brings it back if we don't reload. */
+  disconnectLive();
   otaDialog.value = true;
   otaTitle.value  = title;
   otaPhase.value  = 'rebooting';
   rebootAttempt.value = 0;
+  /* Same-fw restart (reboot / factory reset / boot switch): no baseline fw, so
+   * detection rides the offline→online edge. */
   const came_back = await waitForReboot();
   resolveReturn(came_back, 'Device did not come back online — try refreshing the page manually.');
 }
@@ -200,6 +226,13 @@ function confirmFlash() {
 
 async function startUpload(file, resetConfig) {
   if (!file) return;
+  /* Stop background live-polling for the whole upload→reboot→reload window.
+   * liveState's /api/state GETs are un-abortable (no timeout) and, against the
+   * single-task server that is busy streaming the image and then dark across the
+   * reboot, they hang and tie up the browser's small per-host connection pool —
+   * starving waitForReboot's readiness probe. The post-flash reload re-runs
+   * connectLive(); the failure paths (fail / resolveReturn) bring it back. */
+  disconnectLive();
   /* Modal opens immediately and locks the rest of the UI for the whole
    * upload→write→reboot→reload window. */
   otaDialog.value   = true;
@@ -207,42 +240,81 @@ async function startUpload(file, resetConfig) {
   otaPhase.value    = 'uploading';
   otaProgress.value = 0;
   otaError.value    = '';
+  rebootAttempt.value = 0;
 
-  /* We upload a firmware image (the Vue UI is embedded inside it). Two facts
-   * about the device drive everything below:
-   *
-   *  1. xhr.upload.onprogress can reach 100 % a touch before the device has
-   *     verified + committed the image — it counts bytes handed to the local
-   *     socket, not work the device has finished — so a bar parked at 100 %
-   *     can look frozen for the final verify/reboot.
-   *  2. The device's success reply is routinely lost: it reboots within
-   *     ~1.5 s of sending "200 rebooting", and the reply + final TCP ACKs
-   *     can die with the connection. So we must NOT depend on xhr.onload,
-   *     xhr.upload.onload, or xhr.onerror firing at all.
-   *
-   * What IS reliable: the device runs a SINGLE-TASK HTTP server, so while it
-   * is verifying/installing and then rebooting it answers nothing. The instant
-   * a GET of /api/auth/status succeeds again, it is back on the new firmware.
-   * So the moment the body is on the wire we switch to the indeterminate
-   * 'writing' phase and start polling for the device's return — the poll
-   * self-times to however long the install+reboot takes, then reloads.
-   *
-   * We deliberately never offer a manual reload during 'writing': navigating
-   * away aborts the XHR mid-upload and would corrupt the image. A poll only
-   * succeeds once the server is back, which (being single-task) means the
-   * upload handler has already returned. */
-  let waitStarted = false;   /* entered 'writing' + began polling for return */
-  let superseded  = false;   /* an explicit error response took over */
+  /* Snapshot the running firmware id NOW, while the device is healthy, so the
+   * readiness poll can positively confirm the NEW image booted (a CHANGED fw),
+   * instead of depending on catching the device offline. Best-effort: if it
+   * fails, baselineFw stays null and waitForReboot falls back to the
+   * offline→online edge. */
+  let baselineFw = null;
+  try {
+    const s = await fetchWithTimeout('/api/auth/status', 1500);
+    if (s.ok) baselineFw = (await s.json().catch(() => null))?.fw ?? null;
+  } catch { /* no baseline — fall back to reachability edge */ }
 
+  /* We upload a firmware image (the Vue UI is embedded inside it). The flow
+   * mirrors the plain-reboot path's robustness rule: only start polling for the
+   * device's return AFTER the trigger request's connection has closed — never
+   * while it is still open.
+   *
+   *  1. xhr.upload.onprogress reaching 100 % means the body is on the local
+   *     socket, NOT that the device has finished verifying/committing. At that
+   *     point we switch to the indeterminate 'writing' phase (spinner) but do
+   *     NOT yet poll — the upload connection is still live, and polling against
+   *     a live-then-orphaned connection poisons the browser's pool: a lost
+   *     reply leaves it half-open and subsequent polls get reused onto the dead
+   *     socket, so the device never reads as "back" even once it is.
+   *  2. We begin the reboot poll only once the XHR terminally settles:
+   *       - onload 200  → device committed the image and is rebooting;
+   *       - onerror     → the socket dropped (esp_restart RSTs it), reply lost;
+   *       - onabort     → defensive, treated like onerror.
+   *     In every case the upload connection is now closed and out of the reuse
+   *     pool, so the polls open clean sockets — exactly like the reboot flow,
+   *     which polls only after its short POST has settled.
+   *  3. Fallback: if the socket drops SILENTLY (no RST, so neither onload nor
+   *     onerror fires promptly), start polling anyway after a grace period so a
+   *     stuck settle can't strand the dialog. This is the only path that may
+   *     poll against a still-pooled connection, and it is rare.
+   *
+   * Starting the poll late is now SAFE even when the device has already finished
+   * its (fast) reboot by the time we begin: waitForReboot confirms the return by
+   * a CHANGED firmware id (baselineFw → new fw), a positive level test that does
+   * not require having observed the device offline first. That is what fixes the
+   * silent-drop case (3) where polling could begin only after the device was back
+   * — the old reachability-only check needed an offline→online edge it never saw,
+   * and stranded the dialog.
+   *
+   * A 200 that arrives while the device is still serving the OLD firmware (its
+   * ~1.2 s pre-reboot delay) is harmless: the poll sees the unchanged fw, holds,
+   * and only returns once the fw flips to the new image (or the offline→online
+   * edge fires).
+   *
+   * We never offer a manual reload before the poll starts: until the XHR has
+   * settled, navigating away could abort the upload mid-flight. */
+  let enteredWriting = false;   /* body fully sent; phase switched to 'writing' */
+  let waitStarted    = false;   /* reboot poll has begun */
+  let superseded     = false;   /* an explicit error response took over */
+  let fallbackTimer  = null;    /* silent-drop guard; armed on entering 'writing' */
+
+  /* Body is on the wire — show the indeterminate 'writing' spinner and arm the
+   * silent-drop fallback, but do NOT poll yet (the upload connection is live). */
+  function enterWriting() {
+    if (enteredWriting || superseded) return;
+    enteredWriting = true;
+    if (otaPhase.value === 'uploading') otaPhase.value = 'writing';
+    fallbackTimer = setTimeout(startWriteWait, 8000);
+  }
+
+  /* Begin polling for the device's return — only ever after the upload XHR has
+   * settled (or the silent-drop fallback fires), so the polls run on clean
+   * connections. */
   async function startWriteWait() {
     if (waitStarted || superseded) return;
     waitStarted = true;
-    if (otaPhase.value === 'uploading') otaPhase.value = 'writing';
-    /* Wait for the device to drop offline (writing/rebooting) and come back. A
-     * dropped connection at ~100 % that aborts the flash leaves the OLD image
-     * serving without ever going offline, so the poll never sees the return and
-     * we time out → error, instead of falsely reporting success. */
-    const came_back = await waitForReboot();
+    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+    if (otaPhase.value !== 'writing') otaPhase.value = 'writing';
+    const came_back = await waitForReboot(baselineFw);
     if (superseded) return;             /* a 4xx/5xx response already errored out */
     resolveReturn(came_back,
       'The device did not come back online after the update — it may have been '
@@ -251,8 +323,12 @@ async function startUpload(file, resetConfig) {
 
   function fail(msg) {
     superseded = true;
+    if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
     otaPhase.value = 'error';
     otaError.value = msg;
+    /* Upload rejected/aborted: the device is alive and did NOT reboot. We won't
+     * reload, so resume the live polling we tore down at the start. */
+    connectLive();
   }
 
   const xhr = new XMLHttpRequest();
@@ -263,15 +339,16 @@ async function startUpload(file, resetConfig) {
   xhr.upload.onprogress = (e) => {
     if (!e.lengthComputable) return;
     otaProgress.value = Math.round((e.loaded / e.total) * 100);
-    if (otaProgress.value >= 100) startWriteWait();
+    if (otaProgress.value >= 100) enterWriting();
   };
   /* Belt-and-braces: some browsers skip the final 100 % progress tick. */
-  xhr.upload.onload = () => startWriteWait();
+  xhr.upload.onload = () => enterWriting();
 
   xhr.onload = () => {
     if (xhr.status === 200) {
-      /* Device accepted the image and is rebooting — the poll (already
-       * running, or started here) catches its return. */
+      /* Device accepted the image, committed it, and is rebooting. The reply
+       * arrived, so this connection is closed — poll for the device's return
+       * on a clean socket. */
       startWriteWait();
     } else {
       /* Explicit rejection (bad image, too large, …): the device is alive
@@ -281,14 +358,17 @@ async function startUpload(file, resetConfig) {
     }
   };
   xhr.onerror = () => {
-    /* Once the body is fully buffered out we're in 'writing' and the poll
-     * owns the outcome; a dropped socket here just means the device went
-     * away to reboot. Only treat it as a failure if the upload never
-     * finished. */
-    if (!waitStarted && otaProgress.value < 100) {
+    /* A dropped socket BEFORE the body is fully sent is a genuine upload
+     * failure. After that (we're in 'writing'), the drop just means the device
+     * went away to reboot — its connection is now dead and out of the reuse
+     * pool, so start polling on a fresh socket. */
+    if (!enteredWriting && otaProgress.value < 100) {
       fail('Upload failed — check the connection to the device and try again.');
+    } else {
+      startWriteWait();
     }
   };
+  xhr.onabort = () => { if (enteredWriting) startWriteWait(); };
   xhr.send(file);
 }
 
@@ -462,7 +542,7 @@ function factoryReset() {
           keep this tab open; the page reloads automatically once the device
           is back.
           <template v-if="rebootAttempt > 0">
-            <br />Checking if it's back… attempt {{ rebootAttempt }} of {{ REBOOT_POLL_MAX }}.
+            <br /><br />Checking if it's back… attempt {{ rebootAttempt }} of {{ REBOOT_POLL_MAX }}.
           </template>
         </div>
         <Button v-if="rebootAttempt >= 5"

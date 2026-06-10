@@ -275,6 +275,9 @@ static cJSON *state_json(void)
      * the scheduler when the clock has never synced (AP mode / no NTP). */
     bool time_synced = wifi_mgr_time_synced();
     cJSON_AddBoolToObject(o, "time_synced", time_synced);
+    /* Manual (user-seeded) clock vs real SNTP sync — the UI warns that a manual
+     * clock is lost on reboot and the scheduler then goes inert. */
+    cJSON_AddBoolToObject(o, "time_manual", wifi_mgr_time_manual());
     if (time_synced) {
         time_t now = time(NULL);
         struct tm lt;
@@ -578,8 +581,12 @@ static esp_err_t api_config_put(httpd_req_t *req)
     if (err != ESP_OK) return send_error(req, 500, "save failed");
 
     /* Re-apply the timezone immediately so the scheduler reasons in the new
-     * local time on the very next tick — no reboot needed. */
-    if (strcmp(before.posix_tz, cfg.posix_tz) != 0) app_config_apply_timezone();
+     * local time on the very next tick — no reboot needed. Skip while a manual
+     * clock is active: it runs in UTC0 (the entered wall-clock IS local), so
+     * applying a real TZ now would shift it. The new TZ is stored and takes
+     * effect on the next SNTP sync or reboot. */
+    if (strcmp(before.posix_tz, cfg.posix_tz) != 0 && !wifi_mgr_time_manual())
+        app_config_apply_timezone();
 
     /* Route mode/target through the setters so heater_control resets its
      * mode_state and the event log records the change. Setters re-read the
@@ -626,6 +633,25 @@ static esp_err_t api_change_password(httpd_req_t *req)
     cJSON_Delete(body);
     if (!ok) return send_error(req, 401, "wrong current password");
     if (err != ESP_OK) return send_error(req, 500, "could not set");
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "ok", true);
+    return send_json(req, r, 200);
+}
+
+/* Seed the clock manually (AP mode, no SNTP). Body: { epoch } — seconds of the
+ * user's LOCAL wall-clock (the browser sends now reinterpreted as UTC0). Opens
+ * the scheduler gate; not persisted, so a reboot drops it. */
+static esp_err_t api_time_set(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    cJSON *body = read_json_body(req);
+    if (!body) return send_error(req, 400, "invalid body");
+    const cJSON *e = cJSON_GetObjectItemCaseSensitive(body, "epoch");
+    /* Sanity floor: reject anything before 2023 (a missing/zero clock). */
+    double epoch = cJSON_IsNumber(e) ? e->valuedouble : 0;
+    cJSON_Delete(body);
+    if (epoch < 1700000000.0) return send_error(req, 400, "bad epoch");
+    wifi_mgr_set_manual_time((time_t)epoch);
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "ok", true);
     return send_json(req, r, 200);
@@ -1247,6 +1273,7 @@ esp_err_t web_server_start(void)
     ROUTE("/api/heater/mode",    HTTP_POST, api_heater_mode);
     ROUTE("/api/heater/element", HTTP_POST, api_heater_element);
     ROUTE("/api/safety/clear",  HTTP_POST, api_safety_clear);
+    ROUTE("/api/time",          HTTP_POST, api_time_set);
 
     ROUTE("/api/wifi/scan",     HTTP_GET,  api_wifi_scan);
     ROUTE("/api/wifi/test",     HTTP_POST, api_wifi_test);
