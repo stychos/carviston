@@ -593,10 +593,22 @@ static void control_task(void *arg)
          * power policy on top without ever forcing a satisfied tank on. */
         bool wants[RELAY_COUNT] = { false, false };
         for (int i = 0; i < RELAY_COUNT; ++i) {
+            /* Regulate on the HOTTER of the tank's two NTCs. A non-faulted tank
+             * has both NTCs valid and within probe_disagree_c, so fmaxf is the
+             * hottest water this tank actually sees. Using regulation_c alone let
+             * the safety NTC run up to probe_disagree_c hotter than the thermostat
+             * thought, so the tank kept heating until the 90 °C over-temp backstop
+             * dropped it — making the safety limit the de-facto regulator and
+             * cycling the element against 90 °C instead of cleanly around target.
+             * Stopping on either NTC keeps the over-temp limit dormant as intended
+             * and never overshoots target+hyst (worst case: average water slightly
+             * below setpoint, the correct way to err with no hardware cutoff). */
+            float govern_c = fmaxf(temp.tank[i].regulation_c,
+                                   temp.tank[i].safety_c);
             wants[i] = ok_to_heat && s_state.element_enabled[i] &&
                        !temp.tank[i].fault &&
                        update_heating_phase(s_state.heater_active[i],
-                                            temp.tank[i].regulation_c,
+                                            govern_c,
                                             cfg.target_temp_c, cfg.hysteresis_c);
         }
         bool heating_needed = wants[0] || wants[1];
